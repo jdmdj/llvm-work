@@ -14,8 +14,59 @@
 // This pass must be run after register allocation.  After this pass is
 // executed, it is illegal to construct MO_FrameIndex operands.
 //
-//===----------------------------------------------------------------------===//
+// This pass implements a shrink wrapping variant of prolog/epilog insertion.
+//
+// This implementations of shrink wrapping is done in two parts:
+//   1. Callee-saved register spills are placed in only the basic blocks
+//      where such registers are actually written by the function.
+//   2. Prologues and epilogues are placed only in the basic blocks that
+//      contain function calls.
+//
+// Shrink wrapping uses an analysis similar to the one in GVNPRE to determine
+// which basic blocks require callee-saved register save/restore code.
+//
+// This pass uses MachineDominators and MachineLoopInfo. Loop information
+// is used to prevent shrink wrapping of callee-saved register save/restore
+// code into loops.
+//
+// Part 1. of the implementation is straightforward: the code to save/restore
+// code insertion done in PEI is usable with only a single modification: a
+// map of basic blocks and used callee-saved registers is used to place the
+// save/restore code instead of simply inserting it into the entry block and
+// all exiting blocks.
+//
+// Part 2. is only complicated by the fact that the prologue/epilogue emitters
+// provided by TargetRegisterInfo insert code perforce into the entry and exit
+// blocks. To permit shrink wrapping of prologue/epilogue code, methods must be
+// provided that take a list of basic blocks for code insertion. Since this is
+// a more extensive code change, part 2. will be done later.
+//
+////===----------------------------------------------------------------------===//
 
+#include "llvm/CodeGen/Passes.h"
+#include "llvm/CodeGen/MachineDominators.h"
+#include "llvm/CodeGen/MachineLoopInfo.h"
+#include "llvm/CodeGen/MachineFunctionPass.h"
+#include "llvm/CodeGen/MachineInstr.h"
+#include "llvm/CodeGen/MachineFrameInfo.h"
+#include "llvm/CodeGen/MachineModuleInfo.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
+#include "llvm/CodeGen/RegisterScavenging.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Target/TargetRegisterInfo.h"
+#include "llvm/Target/TargetFrameInfo.h"
+#include "llvm/Target/TargetInstrInfo.h"
+#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/Statistic.h"
+#include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Compiler.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/ADT/STLExtras.h"
+#include <climits>
+
+#if 0
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/MachineInstr.h"
@@ -30,7 +81,13 @@
 #include "llvm/Support/Compiler.h"
 #include "llvm/ADT/STLExtras.h"
 #include <climits>
+#endif
 using namespace llvm;
+
+// Shrink Wrapping:
+static cl::opt<bool>
+ShrinkWrapping("shrink-wrap",
+               cl::desc("Apply shrink wrapping to callee-saved register spills/restores"));
 
 namespace {
   struct VISIBILITY_HIDDEN PEI : public MachineFunctionPass {
@@ -41,10 +98,26 @@ namespace {
       return "Prolog/Epilog Insertion & Frame Finalization";
     }
 
+#if 0
     virtual void getAnalysisUsage(AnalysisUsage &AU) const {
       AU.addPreservedID(MachineLoopInfoID);
       AU.addPreservedID(MachineDominatorsID);
       MachineFunctionPass::getAnalysisUsage(AU);
+    }
+#endif
+
+    // FIXME: Loop preheaders?
+    virtual void getAnalysisUsage(AnalysisUsage &AU) const {
+      AU.setPreservesCFG();
+      AU.addRequired<MachineLoopInfo>();
+      AU.addRequired<MachineDominatorTree>();
+      AU.addPreserved<MachineLoopInfo>();
+      AU.addPreserved<MachineDominatorTree>();
+      MachineFunctionPass::getAnalysisUsage(AU);
+    }
+
+    virtual void releaseMemory() {
+      /// TODO -- release memory used by analysis.
     }
 
     /// runOnMachineFunction - Insert prolog/epilog code and replace abstract
@@ -53,6 +126,12 @@ namespace {
     bool runOnMachineFunction(MachineFunction &Fn) {
       const TargetRegisterInfo *TRI = Fn.getTarget().getRegisterInfo();
       RS = TRI->requiresRegisterScavenging(Fn) ? new RegScavenger() : NULL;
+
+#if 0
+      // TODO -- push into calcCSRPlacement(): Get analyses.
+      LI = &getAnalysis<MachineLoopInfo>();
+      DT = &getAnalysis<MachineDominatorTree>();
+#endif
 
       // Get MachineModuleInfo so that we can track the construction of the
       // frame.
@@ -68,6 +147,9 @@ namespace {
       // the MaxCallFrameSize and HasCalls variables for the function's frame
       // information and eliminates call frame pseudo instructions.
       calculateCalleeSavedRegisters(Fn);
+
+      // ShrinkWrap: Determine placement of CSR spill/restore code.
+      calculateCSRSpillPlacement(Fn);
 
       // Add the code to save and restore the callee saved registers
       saveCalleeSavedRegisters(Fn);
@@ -102,6 +184,31 @@ namespace {
     // stack frame indexes.
     unsigned MinCSFrameIndex, MaxCSFrameIndex;
 
+    // TODO -- finish SAVE, RESTORE analysis for shrink wrapping.
+    // Pass-local analysis results.
+    MachineLoopInfo      *LI;      // Current MachineLoopInfo
+    MachineDominatorTree *DT;      // Machine dominator tree for function (eventually)
+
+    // Analysis info for placing callee saved register saves/restores.
+
+    SetVector UsedCSRegs;
+    DenseMap<MachineBasicBlock*, SetVector> AnticIn, AnticOut;
+    DenseMap<MachineBasicBlock*, SetVector> AvailIn, AvailOut;
+    DenseMap<MachineBasicBlock*, SetVector> CSRUsed;
+    DenseMap<MachineBasicBlock*, SetVector> CSRSave;
+    DenseMap<MachineBasicBlock*, SetVector> CSRRestore;
+
+    void buildsets_availout(MachineBasicBlock::iterator MBBI,
+                            SetVector& currAvail);
+    bool buildsets_anticout(MachineBasicBlock* MBB,
+                            SetVector& anticOut,
+                            SmallPtrSet<BasicBlock*, 8>& visited);
+    unsigned buildsets_anticin(MachineBasicBlock* MBB,
+                               SetVector& anticOut,
+                               SmallPtrSet<BasicBlock*, 8>& visited);
+    void buildsets(MachineFunction& Fn);
+    void calculateCSRSpillPlacement(MachineFunction &Fn);
+
     void calculateCalleeSavedRegisters(MachineFunction &Fn);
     void saveCalleeSavedRegisters(MachineFunction &Fn);
     void calculateFrameObjectOffsets(MachineFunction &Fn);
@@ -116,6 +223,201 @@ namespace {
 /// prolog and epilog code, and eliminates abstract frame references.
 ///
 FunctionPass *llvm::createPrologEpilogCodeInserter() { return new PEI(); }
+
+
+////===----------------------------------------------------------------------===//
+////===----------------------------------------------------------------------===//
+
+/// buildsets_availout - build up avail info on exit from MBBs
+///
+/// bool readsRegister(unsigned Reg, const TargetRegisterInfo *TRI = NULL)
+/// bool modifiesRegister(unsigned Reg, const TargetRegisterInfo *TRI = NULL)
+///
+void PEI::buildsets_availout(MachineBasicBlock::iterator I, SetVector& currAvail) {
+  // TODO -- look at the instruction I...
+}
+
+/// buildsets_anticout - When walking the postdom tree, calculate the ANTIC_OUT
+/// set as a function of the ANTIC_IN set of the block's predecessors
+///
+bool PEI::buildsets_anticout(MachineBasicBlock* MBB,
+                             SetVector& anticOut,
+                             SmallPtrSet<BasicBlock*, 8>& visited) {
+  // TODO
+  return false;
+}
+
+/// buildsets_anticin - Walk the postdom tree, calculating ANTIC_OUT for
+/// each block.  ANTIC_IN is then a function of ANTIC_OUT and the GEN
+/// sets populated in buildsets_availout
+///
+unsigned PEI::buildsets_anticin(MachineBasicBlock* MBB,
+                                SetVector& anticOut,
+                                SmallPtrSet<BasicBlock*, 8>& visited) {
+
+  // TODO
+
+  return 1;
+
+#if 0  
+  SetVector& anticIn = AnticIn[MBB];
+  unsigned old = anticIn.size();
+      
+  bool defer = buildsets_anticout(BB, anticOut, visited);
+  if (defer)
+    return 0;
+  
+  anticIn.clear();
+
+  for (ValueNumberedSet::iterator I = anticOut.begin(),
+       E = anticOut.end(); I != E; ++I) {
+    anticIn.insert(*I);
+    anticIn.set(VN.lookup(*I));
+  }
+
+  clean(anticIn);
+  anticOut.clear();
+  
+  if (old != anticIn.size())
+    return 2;
+  else
+    return 1;
+#endif
+}
+
+/// buildsets - Phase 1 of the main algorithm.  Construct the AVAIL_OUT
+/// and the ANTIC_IN sets.
+///
+void PEI::buildsets(MachineFunction& Fn) {
+
+  MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();   
+  const Function* F = Fn.getFunction();
+
+#if 0
+  llvm::cerr << "PEI::buildsets: " << (F ? F->getName() : "unknown") << "\n";
+#endif
+
+  // 0. Initialize UsedCSRegs set, CSRUsed map.
+  const TargetRegisterInfo *RegInfo = Fn.getTarget().getRegisterInfo();
+  const MachineFrameInfo *FFI = Fn.getFrameInfo();
+  const std::vector<CalleeSavedInfo> CSI = FFI->getCalleeSavedInfo();
+
+  // If no CSRs used, we are done.
+  if (CSI.empty())
+    return;
+
+  for (MachineFunction::iterator MBB = Fn.begin(), E = Fn.end();
+       MBB != E; ++MBB)
+    for (MachineBasicBlock::iterator I = MBB->begin(); I != MBB->end(); ++I) {
+      for (unsigned i = 0, e = CSI.size(); i != e; ++i) {
+        unsigned Reg = CSI[i].getReg();
+        // If instruction I reads or modifies Reg, add it to UsedCSRegs, CSRUsed
+        // map for the current block.
+        if (I->readsRegister(Reg, RegInfo) ||
+            I->modifiesRegister(Reg, RegInfo)) {
+          UsedCSRegs.insert(Reg);
+          CSRUsed[MBB].insert(Reg);
+        }
+      }
+    }
+
+  // Phase 1, Part 1: calculate AVAIL_OUT
+  
+  llvm::cerr << "PEI::buildsets: top-down walk of Machine Dominator Tree:\n";
+
+  // Top-down walk of the dominator tree
+  for (df_iterator<MachineDomTreeNode*> DI = df_begin(DT.getRootNode()),
+         E = df_end(DT.getRootNode()); DI != E; ++DI) {
+    
+    // Get the sets to update for this block
+    SetVector& currAvail = AvailOut[DI->getBlock()];
+    
+    MachineBasicBlock* MBB = DI->getBlock();
+    const BasicBlock* LBB = MBB->getBasicBlock();
+
+    llvm::cerr << "MBB ";
+    if (LBB)
+      llvm::cerr << LBB->getName();
+    else
+      llvm::cerr << "MBB#" << MBB->getNumber();
+    llvm::cerr << " has " << MBB->size() << " instructions\n";
+  
+    // A block inherits AVAIL_OUT from its dominator
+    if (DI->getIDom() != 0)
+      currAvail = AvailOut[DI->getIDom()->getBlock()];
+
+    for (MachineBasicBlock::iterator MBI = MBB->begin(), MBE = MBB->end();
+         MBI != MBE; ++MBI)
+      buildsets_availout(MBI, currAvail);
+  }
+
+  // Phase 1, Part 2: calculate ANTIC_IN
+  
+  SmallPtrSet<MachineBasicBlock*, 8> visited;
+  SmallPtrSet<MachineBasicBlock*, 4> block_changed;
+  for (MachineFunction::iterator FI = Fn.begin(), FE = Fn.end(); FI != FE; ++FI)
+    block_changed.insert(FI);
+  
+  bool changed = true;
+  unsigned iterations = 0;
+  
+  llvm::cerr << "PEI::buildsets: postorder walk of M-CFG:\n";
+
+  while (changed) {
+    changed = false;
+    SetVector anticOut;
+    
+    // Postorder walk of the CFG
+    for (po_iterator<MachineBasicBlock*> MBBI = po_begin(Fn.getBlockNumbered(0)),
+           MBBE = po_end(Fn.getBlockNumbered(0)); MBBI != MBBE; ++MBBI) {
+      MachineBasicBlock* MBB = *MBBI;
+      const BasicBlock* LBB = MBB->getBasicBlock();
+
+      llvm::cerr << "MBB ";
+      if (LBB)
+        llvm::cerr << LBB->getName();
+      else
+        llvm::cerr << "MBB#" << MBB->getNumber();
+      llvm::cerr << " has " << MBB->size() << " instructions\n";
+
+#if 0      
+      if (block_changed.count(MBB) != 0) {
+
+        unsigned ret = buildsets_anticin(MBB, anticOut, visited);
+      
+        if (ret == 0) {
+          changed = true;
+          continue;
+        } else {
+          visited.insert(MBB);
+        
+          if (ret == 2)
+            for (pred_iterator PI = pred_begin(MBB), PE = pred_end(MBB);
+                 PI != PE; ++PI) {
+              block_changed.insert(*PI);
+            }
+          else
+            block_changed.erase(MBB);
+        
+          changed |= (ret == 2);
+        }
+      }
+#endif
+    }
+    iterations++;
+  }
+}
+
+/// calculateCSRSpillPlacement - determine which MBBs of the function
+/// need save, restore code for callee-saved registers by doing a DF analysis
+/// similar to the one used in code motion (GVNPRE). This produces maps of MBBs
+/// to sets of registers (CSRs) for saves and restores. MachineLoopInfo
+/// is used to ensure that CSR save/restore code is not placed inside loops.
+///
+void PEI::calculateCSRSpillPlacement(MachineFunction &Fn) {
+  buildsets(Fn);
+}
+
 
 
 /// calculateCalleeSavedRegisters - Scan the function for modified callee saved
