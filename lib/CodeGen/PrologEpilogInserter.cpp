@@ -272,7 +272,7 @@ void PEI::buildsets(MachineFunction& Fn) {
   if (CSI.empty())
     return;
 
-  MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();   
+  MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();
   const TargetRegisterInfo *RegInfo = Fn.getTarget().getRegisterInfo();
 
   // 0. Initialize UsedCSRegs set, CSRUsed map.
@@ -348,23 +348,22 @@ void PEI::buildsets(MachineFunction& Fn) {
                << stringifyCSRegSet(AvailOut[MBB]) << "\n";
   }
 
-
-  // Phase 1, Part 1: calculate AVAIL_OUT
-  
+  // Debugging stuff
   llvm::cerr << "PEI::buildsets: top-down walk of Machine Dominator Tree:\n";
 
   // Top-down walk of the dominator tree
   for (df_iterator<MachineDomTreeNode*> DI = df_begin(DT.getRootNode()),
          E = df_end(DT.getRootNode()); DI != E; ++DI) {
     
-    // Get the sets to update for this block
-    CSRegSet& currAvail = AvailOut[DI->getBlock()];
-    
     MachineBasicBlock* MBB = DI->getBlock();
 
     llvm::cerr << "MBB: " << MBB->getBasicBlock()->getName()
                << " has " << MBB->size() << " instructions\n";
-  
+
+#if 0  
+    // Get the sets to update for this block
+    CSRegSet& currAvail = AvailOut[DI->getBlock()];
+    
     // A block inherits AVAIL_OUT from its dominator
     if (DI->getIDom() != 0)
       currAvail = AvailOut[DI->getIDom()->getBlock()];
@@ -372,59 +371,8 @@ void PEI::buildsets(MachineFunction& Fn) {
     for (MachineBasicBlock::iterator MBI = MBB->begin(), MBE = MBB->end();
          MBI != MBE; ++MBI) {
       // buildsets_availout(MBI, currAvail);
-      
     }
-  }
-
-  // Phase 1, Part 2: calculate ANTIC_IN
-  
-  SmallPtrSet<MachineBasicBlock*, 8> visited;
-  SmallPtrSet<MachineBasicBlock*, 4> block_changed;
-  for (MachineFunction::iterator FI = Fn.begin(), FE = Fn.end(); FI != FE; ++FI)
-    block_changed.insert(FI);
-  
-  bool changed = true;
-  unsigned iterations = 0;
-  
-  llvm::cerr << "PEI::buildsets: postorder walk of M-CFG:\n";
-
-  while (changed) {
-    changed = false;
-    CSRegSet anticOut;
-    
-    // Postorder walk of the CFG
-    for (po_iterator<MachineBasicBlock*> MBBI = po_begin(Fn.getBlockNumbered(0)),
-           MBBE = po_end(Fn.getBlockNumbered(0)); MBBI != MBBE; ++MBBI) {
-      MachineBasicBlock* MBB = *MBBI;
-
-      llvm::cerr << "MBB: " << MBB->getBasicBlock()->getName()
-                 << " has " << MBB->size() << " instructions\n";
-
-#if 0      
-      if (block_changed.count(MBB) != 0) {
-
-        unsigned ret = buildsets_anticin(MBB, anticOut, visited);
-      
-        if (ret == 0) {
-          changed = true;
-          continue;
-        } else {
-          visited.insert(MBB);
-        
-          if (ret == 2)
-            for (pred_iterator PI = pred_begin(MBB), PE = pred_end(MBB);
-                 PI != PE; ++PI) {
-              block_changed.insert(*PI);
-            }
-          else
-            block_changed.erase(MBB);
-        
-          changed |= (ret == 2);
-        }
-      }
 #endif
-    }
-    iterations++;
   }
 }
 
