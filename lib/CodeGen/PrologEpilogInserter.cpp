@@ -56,7 +56,7 @@
 #include "llvm/Target/TargetRegisterInfo.h"
 #include "llvm/Target/TargetFrameInfo.h"
 #include "llvm/Target/TargetInstrInfo.h"
-#include "llvm/ADT/SetVector.h"
+#include "llvm/ADT/SparseBitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/Statistic.h"
@@ -65,6 +65,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/ADT/STLExtras.h"
 #include <climits>
+#include <sstream>
 
 #if 0
 #include "llvm/CodeGen/Passes.h"
@@ -191,21 +192,17 @@ namespace {
 
     // Analysis info for placing callee saved register saves/restores.
 
-    SetVector UsedCSRegs;
-    DenseMap<MachineBasicBlock*, SetVector> AnticIn, AnticOut;
-    DenseMap<MachineBasicBlock*, SetVector> AvailIn, AvailOut;
-    DenseMap<MachineBasicBlock*, SetVector> CSRUsed;
-    DenseMap<MachineBasicBlock*, SetVector> CSRSave;
-    DenseMap<MachineBasicBlock*, SetVector> CSRRestore;
+#if 0
+    typedef SetVector<unsigned> CSRegSet;
+#endif
+    typedef SparseBitVector<> CSRegSet;
+    CSRegSet UsedCSRegs;
+    DenseMap<MachineBasicBlock*, CSRegSet> AnticIn, AnticOut;
+    DenseMap<MachineBasicBlock*, CSRegSet> AvailIn, AvailOut;
+    DenseMap<MachineBasicBlock*, CSRegSet> CSRUsed;
+    DenseMap<MachineBasicBlock*, CSRegSet> CSRSave;
+    DenseMap<MachineBasicBlock*, CSRegSet> CSRRestore;
 
-    void buildsets_availout(MachineBasicBlock::iterator MBBI,
-                            SetVector& currAvail);
-    bool buildsets_anticout(MachineBasicBlock* MBB,
-                            SetVector& anticOut,
-                            SmallPtrSet<BasicBlock*, 8>& visited);
-    unsigned buildsets_anticin(MachineBasicBlock* MBB,
-                               SetVector& anticOut,
-                               SmallPtrSet<BasicBlock*, 8>& visited);
     void buildsets(MachineFunction& Fn);
     void calculateCSRSpillPlacement(MachineFunction &Fn);
 
@@ -214,6 +211,38 @@ namespace {
     void calculateFrameObjectOffsets(MachineFunction &Fn);
     void replaceFrameIndices(MachineFunction &Fn);
     void insertPrologEpilogCode(MachineFunction &Fn);
+
+    // Convienences.
+
+    // Because SparseBitVector has no _infix_ operator|()...
+    CSRegSet CSRegSetUnion(const CSRegSet& s1, const CSRegSet& s2) {
+      CSRegSet result(s1);
+      result |= s2;
+      return result;
+    }
+
+    // Debugging methods.
+    std::string stringifyCSRegSet(const CSRegSet& s, const char* nm = 0) {
+      std::ostringstream srep;
+      if (nm)
+        srep << nm << " = ";
+      srep << "[";
+      CSRegSet::iterator I = s.begin(), E = s.end();
+      if (I != E) {
+        srep << *I;
+        for (++I; I != E; ++I) {
+          srep << ",";
+          srep << *I;
+        }
+      }
+      srep << "]";
+      return srep.str();
+    }
+
+    void dumpCSRegSet(const CSRegSet& s, const char* nm = 0) {
+      llvm::cerr << stringifyCSRegSet(s, nm) << "\n";
+    }
+
   };
   char PEI::ID = 0;
 }
@@ -228,77 +257,14 @@ FunctionPass *llvm::createPrologEpilogCodeInserter() { return new PEI(); }
 ////===----------------------------------------------------------------------===//
 ////===----------------------------------------------------------------------===//
 
-/// buildsets_availout - build up avail info on exit from MBBs
-///
-/// bool readsRegister(unsigned Reg, const TargetRegisterInfo *TRI = NULL)
-/// bool modifiesRegister(unsigned Reg, const TargetRegisterInfo *TRI = NULL)
-///
-void PEI::buildsets_availout(MachineBasicBlock::iterator I, SetVector& currAvail) {
-  // TODO -- look at the instruction I...
-}
+/// DUMP_CSREGSET - debug convienence
+#define DUMP_CSREGSET(_S) dumpCSRegSet(_S, #_S)
 
-/// buildsets_anticout - When walking the postdom tree, calculate the ANTIC_OUT
-/// set as a function of the ANTIC_IN set of the block's predecessors
-///
-bool PEI::buildsets_anticout(MachineBasicBlock* MBB,
-                             SetVector& anticOut,
-                             SmallPtrSet<BasicBlock*, 8>& visited) {
-  // TODO
-  return false;
-}
-
-/// buildsets_anticin - Walk the postdom tree, calculating ANTIC_OUT for
-/// each block.  ANTIC_IN is then a function of ANTIC_OUT and the GEN
-/// sets populated in buildsets_availout
-///
-unsigned PEI::buildsets_anticin(MachineBasicBlock* MBB,
-                                SetVector& anticOut,
-                                SmallPtrSet<BasicBlock*, 8>& visited) {
-
-  // TODO
-
-  return 1;
-
-#if 0  
-  SetVector& anticIn = AnticIn[MBB];
-  unsigned old = anticIn.size();
-      
-  bool defer = buildsets_anticout(BB, anticOut, visited);
-  if (defer)
-    return 0;
-  
-  anticIn.clear();
-
-  for (ValueNumberedSet::iterator I = anticOut.begin(),
-       E = anticOut.end(); I != E; ++I) {
-    anticIn.insert(*I);
-    anticIn.set(VN.lookup(*I));
-  }
-
-  clean(anticIn);
-  anticOut.clear();
-  
-  if (old != anticIn.size())
-    return 2;
-  else
-    return 1;
-#endif
-}
-
-/// buildsets - Phase 1 of the main algorithm.  Construct the AVAIL_OUT
-/// and the ANTIC_IN sets.
+/// buildsets - Phase 1 of the main algorithm.  Construct the AVAIL_{IN,OUT},
+/// ANTIC_{IN,OUT} and SAVE, RESTORE sets.
 ///
 void PEI::buildsets(MachineFunction& Fn) {
 
-  MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();   
-  const Function* F = Fn.getFunction();
-
-#if 0
-  llvm::cerr << "PEI::buildsets: " << (F ? F->getName() : "unknown") << "\n";
-#endif
-
-  // 0. Initialize UsedCSRegs set, CSRUsed map.
-  const TargetRegisterInfo *RegInfo = Fn.getTarget().getRegisterInfo();
   const MachineFrameInfo *FFI = Fn.getFrameInfo();
   const std::vector<CalleeSavedInfo> CSI = FFI->getCalleeSavedInfo();
 
@@ -306,20 +272,82 @@ void PEI::buildsets(MachineFunction& Fn) {
   if (CSI.empty())
     return;
 
+  MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();   
+  const TargetRegisterInfo *RegInfo = Fn.getTarget().getRegisterInfo();
+
+  // 0. Initialize UsedCSRegs set, CSRUsed map.
+
   for (MachineFunction::iterator MBB = Fn.begin(), E = Fn.end();
-       MBB != E; ++MBB)
+       MBB != E; ++MBB) {
+
     for (MachineBasicBlock::iterator I = MBB->begin(); I != MBB->end(); ++I) {
       for (unsigned i = 0, e = CSI.size(); i != e; ++i) {
         unsigned Reg = CSI[i].getReg();
         // If instruction I reads or modifies Reg, add it to UsedCSRegs, CSRUsed
         // map for the current block.
-        if (I->readsRegister(Reg, RegInfo) ||
-            I->modifiesRegister(Reg, RegInfo)) {
-          UsedCSRegs.insert(Reg);
-          CSRUsed[MBB].insert(Reg);
+        if (!UsedCSRegs.test(Reg) && (I->readsRegister(Reg, RegInfo) ||
+                                      I->modifiesRegister(Reg, RegInfo))) {
+          UsedCSRegs.set(Reg);
+          CSRUsed[MBB].set(Reg);
         }
       }
     }
+    llvm::cerr << "CSRUsed["
+               << MBB->getBasicBlock()->getName() << "] = ";
+    dumpCSRegSet(CSRUsed[MBB]);
+  }
+
+  DUMP_CSREGSET(UsedCSRegs);
+
+  llvm::cerr << "Computing {ANTIC,AVAIL}_{IN,OUT} sets\n";
+
+  // Calculate anticIn, anticOut.
+  std::vector<MachineBasicBlock*> inversePO;
+  for (po_iterator<MachineBasicBlock*> MBBI = po_begin(Fn.getBlockNumbered(0)),
+         MBBE = po_end(Fn.getBlockNumbered(0)); MBBI != MBBE; ++MBBI) {
+    MachineBasicBlock* MBB = *MBBI;
+
+    inversePO.push_back(MBB);
+
+    // AnticOut[MBB]: intersection of AnticIn[succ(MBB)]...
+    for (MachineBasicBlock::succ_iterator SI = MBB->succ_begin(),
+           SE = MBB->succ_end(); SI != SE; ++SI) {
+      MachineBasicBlock* SUCC = *SI;
+      AnticOut[MBB] &= AnticIn[SUCC];
+    }
+    // AnticIn[MBB] = CSRUsed[MBB] u AnticOut[MBB]
+    AnticIn[MBB] = CSRegSetUnion(CSRUsed[MBB], AnticOut[MBB]);
+
+    llvm::cerr << "ANTIC_IN[" << MBB->getBasicBlock()->getName() << "] = "
+               << stringifyCSRegSet(AnticIn[MBB])
+               << "  ANTIC_OUT[" << MBB->getBasicBlock()->getName() << "] = "
+               << stringifyCSRegSet(AnticOut[MBB]) << "\n";
+  }
+
+  llvm::cerr << "-----------------------------------------------------------\n";
+
+  // Inverse post-order traversal of CFG.
+  for (std::vector<MachineBasicBlock*>::reverse_iterator
+         MBBI = inversePO.rbegin(),  MBBE = inversePO.rend();
+         MBBI != MBBE; ++MBBI) {
+
+    MachineBasicBlock* MBB = *MBBI;
+
+    // AvailOut[MBB]: intersection of AvailIn[pred(MBB)]...
+    for (MachineBasicBlock::pred_iterator PI = MBB->pred_begin(),
+           PE = MBB->pred_end(); PI != PE; ++PI) {
+      MachineBasicBlock* PRED = *PI;
+      AvailIn[MBB] &= AvailOut[PRED];
+    }
+    // AvailIn[MBB] = CSRUsed[MBB] u AvailOut[MBB]
+    AvailOut[MBB] = CSRegSetUnion(CSRUsed[MBB], AvailIn[MBB]);
+
+    llvm::cerr << "AVAIL_IN[" << MBB->getBasicBlock()->getName() << "] = "
+               << stringifyCSRegSet(AvailIn[MBB])
+               << "  AVAIL_OUT[" << MBB->getBasicBlock()->getName() << "] = "
+               << stringifyCSRegSet(AvailOut[MBB]) << "\n";
+  }
+
 
   // Phase 1, Part 1: calculate AVAIL_OUT
   
@@ -330,25 +358,22 @@ void PEI::buildsets(MachineFunction& Fn) {
          E = df_end(DT.getRootNode()); DI != E; ++DI) {
     
     // Get the sets to update for this block
-    SetVector& currAvail = AvailOut[DI->getBlock()];
+    CSRegSet& currAvail = AvailOut[DI->getBlock()];
     
     MachineBasicBlock* MBB = DI->getBlock();
-    const BasicBlock* LBB = MBB->getBasicBlock();
 
-    llvm::cerr << "MBB ";
-    if (LBB)
-      llvm::cerr << LBB->getName();
-    else
-      llvm::cerr << "MBB#" << MBB->getNumber();
-    llvm::cerr << " has " << MBB->size() << " instructions\n";
+    llvm::cerr << "MBB: " << MBB->getBasicBlock()->getName()
+               << " has " << MBB->size() << " instructions\n";
   
     // A block inherits AVAIL_OUT from its dominator
     if (DI->getIDom() != 0)
       currAvail = AvailOut[DI->getIDom()->getBlock()];
 
     for (MachineBasicBlock::iterator MBI = MBB->begin(), MBE = MBB->end();
-         MBI != MBE; ++MBI)
-      buildsets_availout(MBI, currAvail);
+         MBI != MBE; ++MBI) {
+      // buildsets_availout(MBI, currAvail);
+      
+    }
   }
 
   // Phase 1, Part 2: calculate ANTIC_IN
@@ -365,20 +390,15 @@ void PEI::buildsets(MachineFunction& Fn) {
 
   while (changed) {
     changed = false;
-    SetVector anticOut;
+    CSRegSet anticOut;
     
     // Postorder walk of the CFG
     for (po_iterator<MachineBasicBlock*> MBBI = po_begin(Fn.getBlockNumbered(0)),
            MBBE = po_end(Fn.getBlockNumbered(0)); MBBI != MBBE; ++MBBI) {
       MachineBasicBlock* MBB = *MBBI;
-      const BasicBlock* LBB = MBB->getBasicBlock();
 
-      llvm::cerr << "MBB ";
-      if (LBB)
-        llvm::cerr << LBB->getName();
-      else
-        llvm::cerr << "MBB#" << MBB->getNumber();
-      llvm::cerr << " has " << MBB->size() << " instructions\n";
+      llvm::cerr << "MBB: " << MBB->getBasicBlock()->getName()
+                 << " has " << MBB->size() << " instructions\n";
 
 #if 0      
       if (block_changed.count(MBB) != 0) {
