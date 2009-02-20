@@ -214,10 +214,22 @@ namespace {
 
     // Convienences.
 
-    // Because SparseBitVector has no _infix_ operator|()...
+    // Because SparseBitVector has no _infix_ operator|&-()...
     CSRegSet CSRegSetUnion(const CSRegSet& s1, const CSRegSet& s2) {
       CSRegSet result(s1);
       result |= s2;
+      return result;
+    }
+
+    CSRegSet CSRegSetIntersection(const CSRegSet& s1, const CSRegSet& s2) {
+      CSRegSet result(s1);
+      result &= s2;
+      return result;
+    }
+
+    CSRegSet CSRegSetDifference(const CSRegSet& s1, const CSRegSet& s2) {
+      CSRegSet result;
+      result.intersectWithComplement(s1, s2);
       return result;
     }
 
@@ -301,13 +313,17 @@ void PEI::buildsets(MachineFunction& Fn) {
 
   llvm::cerr << "Computing {ANTIC,AVAIL}_{IN,OUT} sets\n";
 
-  // Calculate anticIn, anticOut.
+  // Calculate AnticIn, AnticOut using post-order traversal of MCFG.
+#if 0
   std::vector<MachineBasicBlock*> inversePO;
+#endif
   for (po_iterator<MachineBasicBlock*> MBBI = po_begin(Fn.getBlockNumbered(0)),
          MBBE = po_end(Fn.getBlockNumbered(0)); MBBI != MBBE; ++MBBI) {
     MachineBasicBlock* MBB = *MBBI;
 
+#if 0
     inversePO.push_back(MBB);
+#endif
 
     // AnticOut[MBB]: intersection of AnticIn[succ(MBB)]...
     for (MachineBasicBlock::succ_iterator SI = MBB->succ_begin(),
@@ -326,12 +342,20 @@ void PEI::buildsets(MachineFunction& Fn) {
 
   llvm::cerr << "-----------------------------------------------------------\n";
 
-  // Inverse post-order traversal of CFG.
+  // Calculate AvailIn, AvailOut using inverse post-order traversal of MCFG.
+#if 0
   for (std::vector<MachineBasicBlock*>::reverse_iterator
          MBBI = inversePO.rbegin(),  MBBE = inversePO.rend();
          MBBI != MBBE; ++MBBI) {
-
     MachineBasicBlock* MBB = *MBBI;
+  }
+#endif
+
+  // Top-down walk of the dominator tree
+  for (df_iterator<MachineDomTreeNode*> DI = df_begin(DT.getRootNode()),
+         E = df_end(DT.getRootNode()); DI != E; ++DI) {
+    
+    MachineBasicBlock* MBB = DI->getBlock();
 
     // AvailOut[MBB]: intersection of AvailIn[pred(MBB)]...
     for (MachineBasicBlock::pred_iterator PI = MBB->pred_begin(),
@@ -348,6 +372,74 @@ void PEI::buildsets(MachineFunction& Fn) {
                << stringifyCSRegSet(AvailOut[MBB]) << "\n";
   }
 
+  llvm::cerr << "-----------------------------------------------------------\n";
+  // Calculate CSRSave using inverse post-order traversal of MCFG.
+#if 0
+  for (std::vector<MachineBasicBlock*>::reverse_iterator
+         MBBI = inversePO.rbegin(),  MBBE = inversePO.rend();
+         MBBI != MBBE; ++MBBI) {
+
+    MachineBasicBlock* MBB = *MBBI;
+  }
+#endif
+
+  // Top-down walk of the dominator tree
+  for (df_iterator<MachineDomTreeNode*> DI = df_begin(DT.getRootNode()),
+         E = df_end(DT.getRootNode()); DI != E; ++DI) {
+    
+    MachineBasicBlock* MBB = DI->getBlock();
+
+    // Intersect (CSRegs - AnticIn[P]) for all predecessors P of MBB
+    CSRegSet saveRegsPred;
+    MachineBasicBlock::pred_iterator PI = MBB->pred_begin(),
+      PE = MBB->pred_end();
+    if (PI != PE) {
+      MachineBasicBlock* PRED = *PI;
+      saveRegsPred = CSRegSetDifference(UsedCSRegs, AnticOut[PRED]);
+      for (++PI; PI != PE; ++PI) {
+        PRED = *PI;
+        saveRegsPred &= CSRegSetDifference(UsedCSRegs, AnticOut[PRED]);
+      }
+    }
+    // CSRSave[MBB] = (AnticIn[MBB] - AvailIn[MBB]) ^ saveRegsPred
+    CSRSave[MBB] = CSRegSetIntersection(CSRegSetDifference(AnticIn[MBB],
+                                                           AvailIn[MBB]),
+                                        saveRegsPred);
+
+    llvm::cerr << "SAVE[" << MBB->getBasicBlock()->getName() << "] = "
+               << stringifyCSRegSet(CSRSave[MBB]) << "\n";
+  }
+
+  llvm::cerr << "-----------------------------------------------------------\n";
+  // Calculate CSRSave using post-order traversal of MCFG.
+  for (po_iterator<MachineBasicBlock*> MBBI = po_begin(Fn.getBlockNumbered(0)),
+         MBBE = po_end(Fn.getBlockNumbered(0)); MBBI != MBBE; ++MBBI) {
+
+    MachineBasicBlock* MBB = *MBBI;
+
+    // Intersect (CSRegs - AvailOut[S]) for all successors S of MBB
+    CSRegSet restoreRegsSucc;
+    MachineBasicBlock::succ_iterator SI = MBB->succ_begin(),
+      SE = MBB->succ_end();
+    if (SI != SE) {
+      MachineBasicBlock* SUCC = *SI;
+      restoreRegsSucc = CSRegSetDifference(UsedCSRegs, AvailOut[SUCC]);
+      for (++SI; SI != SE; ++SI) {
+        SUCC = *SI;
+        restoreRegsSucc &= CSRegSetDifference(UsedCSRegs, AvailOut[SUCC]);
+      }
+    }
+    // CSRRestore[MBB] = (AvailOut[MBB] - AnticOut[MBB]) ^ restoreRegsSucc
+    CSRRestore[MBB] = CSRegSetIntersection(CSRegSetDifference(AvailOut[MBB],
+                                                              AnticOut[MBB]),
+                                           restoreRegsSucc);
+
+    llvm::cerr << "RESTORE[" << MBB->getBasicBlock()->getName() << "] = "
+               << stringifyCSRegSet(CSRRestore[MBB]) << "\n";
+  }
+
+
+#if 0
   // Debugging stuff
   llvm::cerr << "PEI::buildsets: top-down walk of Machine Dominator Tree:\n";
 
@@ -359,21 +451,9 @@ void PEI::buildsets(MachineFunction& Fn) {
 
     llvm::cerr << "MBB: " << MBB->getBasicBlock()->getName()
                << " has " << MBB->size() << " instructions\n";
-
-#if 0  
-    // Get the sets to update for this block
-    CSRegSet& currAvail = AvailOut[DI->getBlock()];
-    
-    // A block inherits AVAIL_OUT from its dominator
-    if (DI->getIDom() != 0)
-      currAvail = AvailOut[DI->getIDom()->getBlock()];
-
-    for (MachineBasicBlock::iterator MBI = MBB->begin(), MBE = MBB->end();
-         MBI != MBE; ++MBI) {
-      // buildsets_availout(MBI, currAvail);
-    }
-#endif
   }
+#endif // 0
+
 }
 
 /// calculateCSRSpillPlacement - determine which MBBs of the function
