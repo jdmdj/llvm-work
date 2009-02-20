@@ -1,0 +1,52 @@
+
+//===----------------------------------------------------------------------===//
+// SWPEI -- Shrink Wrapping Prolog/Epilog Insertion Pass
+//===----------------------------------------------------------------------===//
+
+Feb 13, 2009 - Initial Revision
+
+[john@paik Fri Feb 13 17:09:21 2009]
+
+
+1. Compute Save/Restore info for function cfg
+   MachineFunction F;
+   Registers R;
+
+   for i in BasicBlocks(F):
+       SAVE(i) = (antic_in(i) - avail_in(i))  /\  //\\:j in Pred(i) (R - antic_in(j))
+       TODO -- RESTORE(i)
+
+   return PEI_Blocks: list of Basic Blocks which are targets for pro/epi+save/restore code, which is used
+   in place of the entry block, exiting blocks, resp.
+
+2. Use SAVE(), RESTORE() data to place pro/epi and csr save/restore code in PEI_Blocks
+
+void PEI::insertPrologEpilogCode()
+
+     Emit prologues to PEI_Blocks (instead of entry block)
+     Emit epilogues to PEI_Blocks (instead of exiting blocks)
+
+void PEI::saveCalleeSavedRegisters()
+
+     Insert CSR save code into PEI_Blocks for registers in PEI_Blocks
+     Insert CSR restore code into PEI_Blocks for registers in PEI_Blocks
+
+//===---------------------------------------------------------------------===//
+void PEI::insertPrologEpilogCode(MachineFunction &Fn) {
+  const TargetRegisterInfo *TRI = Fn.getTarget().getRegisterInfo();
+
+  // Add prologue to the function...
+  TRI->emitPrologue(Fn);
+
+  // Add epilogue to restore the callee-save registers in each exiting block
+  for (MachineFunction::iterator I = Fn.begin(), E = Fn.end(); I != E; ++I) {
+    // If last instruction is a return instruction, add an epilogue
+    if (!I->empty() && I->back().getDesc().isReturn())
+      TRI->emitEpilogue(Fn, *I);
+  }
+}
+
+
+
+//===---------------------------------------------------------------------===//
+//===---------------------------------------------------------------------===//

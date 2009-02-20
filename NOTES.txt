@@ -1,0 +1,64 @@
+
+//===----------------------------------------------------------------------===//
+// NOTES.txt -- general notes on working in LLVM, this information is VOLATILE
+//===----------------------------------------------------------------------===//
+
+Feb 15, 2009 - Initial Revision
+
+[john@paik Sun Feb 15 12:42:42 2009]
+
+//===----------------------------------------------------------------------===//
+// CodeGen Passes
+//===----------------------------------------------------------------------===//
+
+This note describes how to add a new "common" CodeGen pass to the LLVM target-independent
+back end.
+
+1. Pass creator defined in passes implementation:
+
+MyCGPass.cpp:
+
+namespace {
+  struct VISIBILITY_HIDDEN MyCGPass : public MachineFunctionPass {
+    static char ID;
+    MyCGPass() : MachineFunctionPass(&ID) {}
+
+    const char *getPassName() const {
+      return "My CodeGen Pass";
+    }
+    ...
+  };
+  char MyCGPass::ID = 0;
+}
+
+FunctionPass *llvm::createMyCGPass() { return new MyCGPass(); }
+
+2. Add pass declaration for pass creator function to Passes.h:
+
+include/llvm/CodeGen/Passes.h:
+
+namespace llvm {
+  ...
+
+  FunctionPass *llvm::createMyCGPass();
+  ...
+}
+
+3. Pass creator must be called in the appropriate pass init. method of LLVMTargetMachine
+    IN THE CORRECT ORDER and obeying any options/constraints in effect for the pass:
+
+lib/CodeGen/LLVMTargetMachine.cpp:
+
+  addCommonCodeGenPasses():
+  ...
+  PM.add(createPrologEpilogCodeInserter());
+  ...
+  if (runMyCGPass)
+    PM.add(createMyCGPass());
+
+
+
+  
+
+
+
