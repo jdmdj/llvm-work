@@ -41,7 +41,9 @@
 // provided that take a list of basic blocks for code insertion. Since this is
 // a more extensive code change, part 2. will be done later.
 //
-////===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
+
+#define DEBUG_TYPE "shrink-wrap"
 
 #include "llvm/CodeGen/Passes.h"
 #include "llvm/CodeGen/MachineDominators.h"
@@ -67,22 +69,6 @@
 #include <climits>
 #include <sstream>
 
-#if 0
-#include "llvm/CodeGen/Passes.h"
-#include "llvm/CodeGen/MachineFunctionPass.h"
-#include "llvm/CodeGen/MachineInstr.h"
-#include "llvm/CodeGen/MachineFrameInfo.h"
-#include "llvm/CodeGen/MachineModuleInfo.h"
-#include "llvm/CodeGen/MachineRegisterInfo.h"
-#include "llvm/CodeGen/RegisterScavenging.h"
-#include "llvm/Target/TargetMachine.h"
-#include "llvm/Target/TargetRegisterInfo.h"
-#include "llvm/Target/TargetFrameInfo.h"
-#include "llvm/Target/TargetInstrInfo.h"
-#include "llvm/Support/Compiler.h"
-#include "llvm/ADT/STLExtras.h"
-#include <climits>
-#endif
 using namespace llvm;
 
 // Shrink Wrapping:
@@ -98,14 +84,6 @@ namespace {
     const char *getPassName() const {
       return "Prolog/Epilog Insertion & Frame Finalization";
     }
-
-#if 0
-    virtual void getAnalysisUsage(AnalysisUsage &AU) const {
-      AU.addPreservedID(MachineLoopInfoID);
-      AU.addPreservedID(MachineDominatorsID);
-      MachineFunctionPass::getAnalysisUsage(AU);
-    }
-#endif
 
     // FIXME: Loop preheaders?
     virtual void getAnalysisUsage(AnalysisUsage &AU) const {
@@ -127,12 +105,6 @@ namespace {
     bool runOnMachineFunction(MachineFunction &Fn) {
       const TargetRegisterInfo *TRI = Fn.getTarget().getRegisterInfo();
       RS = TRI->requiresRegisterScavenging(Fn) ? new RegScavenger() : NULL;
-
-#if 0
-      // TODO -- push into calcCSRPlacement(): Get analyses.
-      LI = &getAnalysis<MachineLoopInfo>();
-      DT = &getAnalysis<MachineDominatorTree>();
-#endif
 
       // Get MachineModuleInfo so that we can track the construction of the
       // frame.
@@ -177,7 +149,7 @@ namespace {
       delete RS;
       return true;
     }
-  
+
   private:
     RegScavenger *RS;
 
@@ -185,16 +157,8 @@ namespace {
     // stack frame indexes.
     unsigned MinCSFrameIndex, MaxCSFrameIndex;
 
-    // TODO -- finish SAVE, RESTORE analysis for shrink wrapping.
-    // Pass-local analysis results.
-    MachineLoopInfo      *LI;      // Current MachineLoopInfo
-    MachineDominatorTree *DT;      // Machine dominator tree for function (eventually)
-
     // Analysis info for placing callee saved register saves/restores.
 
-#if 0
-    typedef SetVector<unsigned> CSRegSet;
-#endif
     typedef SparseBitVector<> CSRegSet;
     CSRegSet UsedCSRegs;
     DenseMap<MachineBasicBlock*, CSRegSet> AnticIn, AnticOut;
@@ -233,6 +197,28 @@ namespace {
       return result;
     }
 
+    MachineBasicBlock* getTopLevelLoopPreheader(MachineLoop* LP) {
+      assert(LP && "Machine loop is NULL.");
+      MachineBasicBlock* PHDR = LP->getLoopPreheader();
+      MachineLoop* PLP = LP->getParentLoop();
+      while (PLP) {
+        PHDR = PLP->getLoopPreheader();
+        PLP = PLP->getParentLoop();
+      }
+      return PHDR;
+    }
+
+    MachineLoop* getTopLevelLoopParent(MachineLoop *LP) {
+      if (LP == 0)
+        return 0;
+      MachineLoop* PLP = LP->getParentLoop();
+      while (PLP) {
+        LP = PLP;
+        PLP = PLP->getParentLoop();
+      }
+      return LP;
+    }
+
     // Debugging methods.
     std::string stringifyCSRegSet(const CSRegSet& s, const char* nm = 0) {
       std::ostringstream srep;
@@ -251,10 +237,6 @@ namespace {
       return srep.str();
     }
 
-    void dumpCSRegSet(const CSRegSet& s, const char* nm = 0) {
-      llvm::cerr << stringifyCSRegSet(s, nm) << "\n";
-    }
-
   };
   char PEI::ID = 0;
 }
@@ -266,11 +248,8 @@ namespace {
 FunctionPass *llvm::createPrologEpilogCodeInserter() { return new PEI(); }
 
 
-////===----------------------------------------------------------------------===//
-////===----------------------------------------------------------------------===//
-
-/// DUMP_CSREGSET - debug convienence
-#define DUMP_CSREGSET(_S) dumpCSRegSet(_S, #_S)
+//===----------------------------------------------------------------------===//
+//===----------------------------------------------------------------------===//
 
 /// buildsets - Phase 1 of the main algorithm.  Construct the AVAIL_{IN,OUT},
 /// ANTIC_{IN,OUT} and SAVE, RESTORE sets.
@@ -280,38 +259,127 @@ void PEI::buildsets(MachineFunction& Fn) {
   const MachineFrameInfo *FFI = Fn.getFrameInfo();
   const std::vector<CalleeSavedInfo> CSI = FFI->getCalleeSavedInfo();
 
+  DOUT << "buildsets for " << Fn.getFunction()->getName() << "\n";
+
   // If no CSRs used, we are done.
-  if (CSI.empty())
+  if (CSI.empty()) {
+    DOUT << Fn.getFunction()->getName()
+         << " uses no callee-saved registers.\n";
     return;
+  }
 
   MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();
+  MachineLoopInfo &LI = getAnalysis<MachineLoopInfo>();
+
   const TargetRegisterInfo *RegInfo = Fn.getTarget().getRegisterInfo();
+  bool allUsedCSRegsInEntryBlock = true;
+
+  // DEBUG -- dump loop info
+  DOUT << "Loops of " << Fn.getFunction()->getName() << ":\n";
+  for (MachineLoopInfo::iterator
+         I = LI.begin(), E = LI.end(); I != E; ++I) {
+    MachineLoop* LP = *I;
+    MachineBasicBlock* HDR = LP->getHeader();
+    MachineBasicBlock* PHDR = LP->getLoopPreheader();
+    SmallVector<MachineBasicBlock*, 4> exitingBlocks;
+
+    LP->getExitingBlocks(exitingBlocks);
+
+    DOUT << "Loop with header "
+         << HDR->getBasicBlock()->getName();
+    if (PHDR) {
+      DOUT << " and preheader " << PHDR->getBasicBlock()->getName();
+    }
+    DOUT << " has exit(s):\n";
+    for (unsigned i = 0; i < exitingBlocks.size(); ++i) {
+      DOUT << " " << exitingBlocks[i]->getBasicBlock()->getName();
+    }
+    DOUT << "\n";
+  }
 
   // 0. Initialize UsedCSRegs set, CSRUsed map.
-
+  //    At the same time, put entry block directly into
+  //    CSRSave, CSRRestore sets if any CSRs are used.
+  SmallVector<MachineBasicBlock*, 4> returnBlocks;
+  for (MachineFunction::iterator MBB = Fn.begin(), E = Fn.end();
+       MBB != E; ++MBB)
+    // Catch return blocks.
+    if (!MBB->empty() && MBB->back().getDesc().isReturn()) {
+      returnBlocks.push_back(MBB);
+    }
   for (MachineFunction::iterator MBB = Fn.begin(), E = Fn.end();
        MBB != E; ++MBB) {
 
     for (MachineBasicBlock::iterator I = MBB->begin(); I != MBB->end(); ++I) {
       for (unsigned i = 0, e = CSI.size(); i != e; ++i) {
         unsigned Reg = CSI[i].getReg();
-        // If instruction I reads or modifies Reg, add it to UsedCSRegs, CSRUsed
-        // map for the current block.
+        // If instruction I reads or modifies Reg, add it to UsedCSRegs,
+        // CSRUsed map for the current block.
         if (!UsedCSRegs.test(Reg) && (I->readsRegister(Reg, RegInfo) ||
                                       I->modifiesRegister(Reg, RegInfo))) {
           UsedCSRegs.set(Reg);
           CSRUsed[MBB].set(Reg);
+          // Check for a used CSR in a non-entry block.
+          if (MBB->pred_size() == 0) {
+            CSRSave[MBB].set(Reg);
+            for (unsigned i = 0; i < returnBlocks.size(); ++i)
+              CSRRestore[returnBlocks[i]].set(Reg);
+          } else
+            allUsedCSRegsInEntryBlock = false;
+
+          // DEBUG
+          if (MachineLoop* LP = LI.getLoopFor(MBB)) {
+            MachineBasicBlock* HDR = LP->getHeader();
+            MachineBasicBlock* PHDR = LP->getLoopPreheader();
+            SmallVector<MachineBasicBlock*, 4> exitingBlocks;
+
+            LP->getExitingBlocks(exitingBlocks);
+
+            DOUT << "MBB " << MBB->getBasicBlock()->getName()
+                 << " is in loop of depth "
+                 << LP->getLoopDepth()
+                 << " with header "
+                 << HDR->getBasicBlock()->getName();
+            if (PHDR) {
+              DOUT << " and preheader " << PHDR->getBasicBlock()->getName();
+            }
+            DOUT << " which has exit(s):\n";
+            for (unsigned i = 0; i < exitingBlocks.size(); ++i) {
+              DOUT << " " << exitingBlocks[i]->getBasicBlock()->getName();
+            }
+
+            DOUT << "\n";
+            if (MachineLoop* PLP = LP->getParentLoop()) {
+              while (PLP) {
+                DOUT << " parent loop header "
+                     << PLP->getHeader()->getBasicBlock()->getName()
+                     << " preheader "
+                     << PLP->getLoopPreheader()->getBasicBlock()->getName();
+                PLP = PLP->getParentLoop();
+              }
+              DOUT << "\n";
+            }
+          }
+          // DEBUG
         }
       }
     }
-    llvm::cerr << "CSRUsed["
-               << MBB->getBasicBlock()->getName() << "] = ";
-    dumpCSRegSet(CSRUsed[MBB]);
+    DOUT << "CSRUsed[" << MBB->getBasicBlock()->getName() << "] = "
+         << stringifyCSRegSet(CSRUsed[MBB]) << "\n";
   }
 
-  DUMP_CSREGSET(UsedCSRegs);
+  DOUT << "UsedCSRegs = " << stringifyCSRegSet(UsedCSRegs) << "\n";
 
-  llvm::cerr << "Computing {ANTIC,AVAIL}_{IN,OUT} sets\n";
+  // If all uses of CSRegs are in the entry block, nothing to do:
+  // spills go in entry block, restores go in exiting blocks.
+  if (allUsedCSRegsInEntryBlock) {
+
+    DOUT << "All uses of CSRegs are in entry block, nothing to do.\n";
+
+    return;
+  }
+
+  DOUT << "Computing {ANTIC,AVAIL}_{IN,OUT} sets\n";
 
   // Calculate AnticIn, AnticOut using post-order traversal of MCFG.
 #if 0
@@ -334,15 +402,15 @@ void PEI::buildsets(MachineFunction& Fn) {
     // AnticIn[MBB] = CSRUsed[MBB] u AnticOut[MBB]
     AnticIn[MBB] = CSRegSetUnion(CSRUsed[MBB], AnticOut[MBB]);
 
-    llvm::cerr << "ANTIC_IN[" << MBB->getBasicBlock()->getName() << "] = "
+    DOUT << "ANTIC_IN[" << MBB->getBasicBlock()->getName() << "] = "
                << stringifyCSRegSet(AnticIn[MBB])
                << "  ANTIC_OUT[" << MBB->getBasicBlock()->getName() << "] = "
                << stringifyCSRegSet(AnticOut[MBB]) << "\n";
   }
 
-  llvm::cerr << "-----------------------------------------------------------\n";
+  DOUT << "-----------------------------------------------------------\n";
 
-  // Calculate AvailIn, AvailOut using inverse post-order traversal of MCFG.
+  // Calculate Avail{In,Out} using inverse post-order traversal of Machine-CFG.
 #if 0
   for (std::vector<MachineBasicBlock*>::reverse_iterator
          MBBI = inversePO.rbegin(),  MBBE = inversePO.rend();
@@ -351,10 +419,10 @@ void PEI::buildsets(MachineFunction& Fn) {
   }
 #endif
 
-  // Top-down walk of the dominator tree
+  // Calculate Avail{In,Out} via top-down walk of Machine dominator tree.
   for (df_iterator<MachineDomTreeNode*> DI = df_begin(DT.getRootNode()),
          E = df_end(DT.getRootNode()); DI != E; ++DI) {
-    
+
     MachineBasicBlock* MBB = DI->getBlock();
 
     // AvailOut[MBB]: intersection of AvailIn[pred(MBB)]...
@@ -366,15 +434,16 @@ void PEI::buildsets(MachineFunction& Fn) {
     // AvailIn[MBB] = CSRUsed[MBB] u AvailOut[MBB]
     AvailOut[MBB] = CSRegSetUnion(CSRUsed[MBB], AvailIn[MBB]);
 
-    llvm::cerr << "AVAIL_IN[" << MBB->getBasicBlock()->getName() << "] = "
+    DOUT << "AVAIL_IN[" << MBB->getBasicBlock()->getName() << "] = "
                << stringifyCSRegSet(AvailIn[MBB])
                << "  AVAIL_OUT[" << MBB->getBasicBlock()->getName() << "] = "
                << stringifyCSRegSet(AvailOut[MBB]) << "\n";
   }
 
-  llvm::cerr << "-----------------------------------------------------------\n";
-  // Calculate CSRSave using inverse post-order traversal of MCFG.
+  DOUT << "-----------------------------------------------------------\n";
+
 #if 0
+  // Calculate CSRSave using inverse post-order traversal of Machine-CFG.
   for (std::vector<MachineBasicBlock*>::reverse_iterator
          MBBI = inversePO.rbegin(),  MBBE = inversePO.rend();
          MBBI != MBBE; ++MBBI) {
@@ -383,73 +452,132 @@ void PEI::buildsets(MachineFunction& Fn) {
   }
 #endif
 
-  // Top-down walk of the dominator tree
+  // Calculate CSRSave via top-down walk of Machine dominator tree.
   for (df_iterator<MachineDomTreeNode*> DI = df_begin(DT.getRootNode()),
          E = df_end(DT.getRootNode()); DI != E; ++DI) {
-    
+
     MachineBasicBlock* MBB = DI->getBlock();
 
-    // Intersect (CSRegs - AnticIn[P]) for all predecessors P of MBB
-    CSRegSet saveRegsPred;
-    MachineBasicBlock::pred_iterator PI = MBB->pred_begin(),
-      PE = MBB->pred_end();
-    if (PI != PE) {
-      MachineBasicBlock* PRED = *PI;
-      saveRegsPred = CSRegSetDifference(UsedCSRegs, AnticOut[PRED]);
-      for (++PI; PI != PE; ++PI) {
-        PRED = *PI;
-        saveRegsPred &= CSRegSetDifference(UsedCSRegs, AnticOut[PRED]);
+    if (MBB->pred_size() > 0) {
+      // Intersect (CSRegs - AnticIn[P]) for all predecessors P of MBB
+      CSRegSet anticInPreds;
+      MachineBasicBlock::pred_iterator PI = MBB->pred_begin(),
+        PE = MBB->pred_end();
+      if (PI != PE) {
+        MachineBasicBlock* PRED = *PI;
+        anticInPreds = CSRegSetDifference(UsedCSRegs, AnticOut[PRED]);
+        for (++PI; PI != PE; ++PI) {
+          PRED = *PI;
+          anticInPreds &= CSRegSetDifference(UsedCSRegs, AnticOut[PRED]);
+        }
       }
+      // CSRSave[MBB] = (AnticIn[MBB] - AvailIn[MBB]) ^ anticInPreds
+      CSRSave[MBB] = CSRegSetIntersection(CSRegSetDifference(AnticIn[MBB],
+                                                             AvailIn[MBB]),
+                                          anticInPreds);
     }
-    // CSRSave[MBB] = (AnticIn[MBB] - AvailIn[MBB]) ^ saveRegsPred
-    CSRSave[MBB] = CSRegSetIntersection(CSRegSetDifference(AnticIn[MBB],
-                                                           AvailIn[MBB]),
-                                        saveRegsPred);
 
-    llvm::cerr << "SAVE[" << MBB->getBasicBlock()->getName() << "] = "
+    DOUT << "SAVE[" << MBB->getBasicBlock()->getName() << "] = "
                << stringifyCSRegSet(CSRSave[MBB]) << "\n";
   }
+  // Move saves inside loops to the preheaders of the outermost (top level)
+  // containing loops.
+  for (DenseMap<MachineBasicBlock*, CSRegSet>::iterator I = CSRSave.begin(),
+         E = CSRSave.end(); I != E; ++I) {
+    MachineBasicBlock* MBB = I->first;
+    if (CSRSave[MBB].empty())
+      continue;
+    if (MachineLoop* LP = LI.getLoopFor(MBB)) {
+      CSRegSet emptySet;
+      MachineBasicBlock* LPH = getTopLevelLoopPreheader(LP);
+      assert(LPH && "Loop has no top level preheader?");
 
-  llvm::cerr << "-----------------------------------------------------------\n";
-  // Calculate CSRSave using post-order traversal of MCFG.
+      DOUT << "Moving saves of "
+           << stringifyCSRegSet(CSRSave[MBB])
+           << " from " << MBB->getBasicBlock()->getName()
+           << " to " << LPH->getBasicBlock()->getName() << "\n";
+      // Add CSRegSet from MBB to LPH, empty out MBB's CSRegSet.
+      CSRSave[LPH] |= CSRSave[MBB];
+      CSRSave[MBB] &= emptySet;
+    }
+  }
+
+  DOUT << "-----------------------------------------------------------\n";
+
+  // Calculate CSRRestore using post-order traversal of Machine-CFG.
   for (po_iterator<MachineBasicBlock*> MBBI = po_begin(Fn.getBlockNumbered(0)),
          MBBE = po_end(Fn.getBlockNumbered(0)); MBBI != MBBE; ++MBBI) {
 
     MachineBasicBlock* MBB = *MBBI;
 
-    // Intersect (CSRegs - AvailOut[S]) for all successors S of MBB
-    CSRegSet restoreRegsSucc;
-    MachineBasicBlock::succ_iterator SI = MBB->succ_begin(),
-      SE = MBB->succ_end();
-    if (SI != SE) {
-      MachineBasicBlock* SUCC = *SI;
-      restoreRegsSucc = CSRegSetDifference(UsedCSRegs, AvailOut[SUCC]);
-      for (++SI; SI != SE; ++SI) {
-        SUCC = *SI;
-        restoreRegsSucc &= CSRegSetDifference(UsedCSRegs, AvailOut[SUCC]);
+    // May already be set for return blocks.
+    if (CSRRestore[MBB].empty() && MBB->pred_size() > 0) {
+      // Intersect (CSRegs - AvailOut[S]) for all successors S of MBB
+      CSRegSet availOutPreds;
+      MachineBasicBlock::succ_iterator SI = MBB->succ_begin(),
+        SE = MBB->succ_end();
+      if (SI != SE) {
+        MachineBasicBlock* SUCC = *SI;
+        availOutPreds = CSRegSetDifference(UsedCSRegs, AvailOut[SUCC]);
+        for (++SI; SI != SE; ++SI) {
+          SUCC = *SI;
+          availOutPreds &= CSRegSetDifference(UsedCSRegs, AvailOut[SUCC]);
+        }
       }
+      // CSRRestore[MBB] = (AvailOut[MBB] - AnticOut[MBB]) ^ availOutPreds
+      CSRRestore[MBB] = CSRegSetIntersection(CSRegSetDifference(AvailOut[MBB],
+                                                                AnticOut[MBB]),
+                                             availOutPreds);
     }
-    // CSRRestore[MBB] = (AvailOut[MBB] - AnticOut[MBB]) ^ restoreRegsSucc
-    CSRRestore[MBB] = CSRegSetIntersection(CSRegSetDifference(AvailOut[MBB],
-                                                              AnticOut[MBB]),
-                                           restoreRegsSucc);
-
-    llvm::cerr << "RESTORE[" << MBB->getBasicBlock()->getName() << "] = "
+    DOUT << "RESTORE[" << MBB->getBasicBlock()->getName() << "] = "
                << stringifyCSRegSet(CSRRestore[MBB]) << "\n";
+  }
+  // Move restores inside loops to the exits of the outermost (top level)
+  // containing loops.
+  for (DenseMap<MachineBasicBlock*, CSRegSet>::iterator I = CSRRestore.begin(),
+         E = CSRRestore.end(); I != E; ++I) {
+    MachineBasicBlock* MBB = I->first;
+
+    if (CSRRestore[MBB].empty())
+      continue;
+
+    if (MachineLoop* LP = LI.getLoopFor(MBB)) {
+      CSRegSet emptySet;
+
+      LP = getTopLevelLoopParent(LP);
+      assert(LP && "Loop with no top level parent?");
+
+      SmallVector<MachineBasicBlock*, 4> exitBlocks;
+
+      LP->getExitBlocks(exitBlocks);
+      assert(exitBlocks.size() > 0 && "Loop has no top level exit blocks?");
+      for (unsigned i = 0; i < exitBlocks.size(); ++i) {
+        MachineBasicBlock* EXB = exitBlocks[i];
+
+        DOUT << "Moving restores of "
+             << stringifyCSRegSet(CSRRestore[MBB])
+             << " from " << MBB->getBasicBlock()->getName()
+             << " to " << EXB->getBasicBlock()->getName() << "\n";
+
+        // Add CSRegSet from MBB to LPE, empty out MBB's CSRegSet.
+        CSRRestore[EXB] |= CSRRestore[MBB];
+      }
+      CSRRestore[MBB] &= emptySet;
+    }
   }
 
 
 #if 0
   // Debugging stuff
-  llvm::cerr << "PEI::buildsets: top-down walk of Machine Dominator Tree:\n";
+  DOUT << "PEI::buildsets: top-down walk of Machine Dominator Tree:\n";
 
   // Top-down walk of the dominator tree
   for (df_iterator<MachineDomTreeNode*> DI = df_begin(DT.getRootNode()),
          E = df_end(DT.getRootNode()); DI != E; ++DI) {
-    
+
     MachineBasicBlock* MBB = DI->getBlock();
 
-    llvm::cerr << "MBB: " << MBB->getBasicBlock()->getName()
+    DOUT << "MBB: " << MBB->getBasicBlock()->getName()
                << " has " << MBB->size() << " instructions\n";
   }
 #endif // 0
@@ -593,7 +721,7 @@ void PEI::saveCalleeSavedRegisters(MachineFunction &Fn) {
   // Get callee saved register information.
   MachineFrameInfo *FFI = Fn.getFrameInfo();
   const std::vector<CalleeSavedInfo> &CSI = FFI->getCalleeSavedInfo();
-  
+
   // Early exit if no callee saved registers are modified!
   if (CSI.empty())
     return;
@@ -633,7 +761,7 @@ void PEI::saveCalleeSavedRegisters(MachineFunction &Fn) {
       MachineBasicBlock::iterator BeforeI = I;
       if (!AtStart)
         --BeforeI;
-      
+
       // Restore all registers immediately before the return and any terminators
       // that preceed it.
       if (!TII.restoreCalleeSavedRegisters(*MBB, I, CSI)) {
