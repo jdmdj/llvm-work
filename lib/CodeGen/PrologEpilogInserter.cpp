@@ -85,7 +85,6 @@ namespace {
       return "Prolog/Epilog Insertion & Frame Finalization";
     }
 
-    // FIXME: Loop preheaders?
     virtual void getAnalysisUsage(AnalysisUsage &AU) const {
       AU.setPreservesCFG();
       AU.addRequired<MachineLoopInfo>();
@@ -160,14 +159,21 @@ namespace {
 
     // Analysis info for placing callee saved register saves/restores.
 
+    // CSRegSet contains indices into the Callee Saved Register Info
+    // vector built by calculateCalleeSavedRegisters() and accessed
+    // via Fn.getFrameInfo()->getCalleeSavedInfo().
     typedef SparseBitVector<> CSRegSet;
+
+    // CSRegBlockMap maps MachineBasicBlocks to sets of callee
+    // saved register indices.
     typedef DenseMap<MachineBasicBlock*, CSRegSet> CSRegBlockMap;
 
-    // TODO -- move UsedCSRegs, {Antic,Avail}{In,Out}, CSRUsed into
-    // placeCSRSpillsAndRestores().
+    // Set and maps for callee saved registers:
+    //  used in function (UsedCSRegs)
+    //  used in a basic block (CSRUsed)
+    //  to be spilled at the entry to a basic block (CSRSave)
+    //  to be restored at the end of a basic block (CSRRestore)
     CSRegSet UsedCSRegs;
-    CSRegBlockMap AnticIn, AnticOut;
-    CSRegBlockMap AvailIn, AvailOut;
     CSRegBlockMap CSRUsed;
     CSRegBlockMap CSRSave;
     CSRegBlockMap CSRRestore;
@@ -181,6 +187,18 @@ namespace {
     void insertPrologEpilogCode(MachineFunction &Fn);
 
     // Convienences used by placeCSRSpillsAndRestores().
+
+    void clearCSRegSet(CSRegSet& s) {
+      CSRegSet emptySet;
+      s &= emptySet;
+    }
+
+    void clearSets() {
+      clearCSRegSet(UsedCSRegs);
+      CSRUsed.clear();
+      CSRSave.clear();
+      CSRRestore.clear();
+    }
 
     // Because SparseBitVector has no _infix_ operator|&-()...
     CSRegSet CSRegSetUnion(const CSRegSet& s1, const CSRegSet& s2) {
@@ -224,22 +242,26 @@ namespace {
     }
 
     // Debugging methods.
-    std::string stringifyCSRegSet(const CSRegSet& s,
-                                  const TargetRegisterInfo* TRI = 0) {
+    std::string stringifyCSRegSet(const CSRegSet& s, MachineFunction &Fn) {
+      const TargetRegisterInfo* TRI = Fn.getTarget().getRegisterInfo();
+      const std::vector<CalleeSavedInfo> CSI =
+        Fn.getFrameInfo()->getCalleeSavedInfo();
+
+      unsigned reg;
       std::ostringstream srep;
+      if (CSI.size() == 0) {
+        srep << "[]";
+        return srep.str();
+      }
       srep << "[";
       CSRegSet::iterator I = s.begin(), E = s.end();
       if (I != E) {
-        if (TRI)
-          srep << TRI->getName(*I);
-        else
-          srep << *I;
+        reg = CSI[*I].getReg();
+        srep << TRI->getName(reg);
         for (++I; I != E; ++I) {
+          reg = CSI[*I].getReg();
           srep << ",";
-          if (TRI)
-            srep << TRI->getName(*I);
-          else
-            srep << *I;
+          srep << TRI->getName(reg);
         }
       }
       srep << "]";
@@ -265,11 +287,17 @@ FunctionPass *llvm::createPrologEpilogCodeInserter() { return new PEI(); }
 ///
 void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
 
-  const MachineFrameInfo *FFI = Fn.getFrameInfo();
-  const std::vector<CalleeSavedInfo> CSI = FFI->getCalleeSavedInfo();
+  // Sets used to compute spill, restore placement sets.
+  CSRegBlockMap AnticIn, AnticOut;
+  CSRegBlockMap AvailIn, AvailOut;
+  const std::vector<CalleeSavedInfo> CSI =
+    Fn.getFrameInfo()->getCalleeSavedInfo();
 
-  DOUT << "Determine spill placement for "
+  DOUT << "Place CSR spills/restores for "
        << Fn.getFunction()->getName() << "\n";
+
+  // Clear Save, Restore sets.
+  clearSets();
 
   // If no CSRs used, we are done.
   if (CSI.empty()) {
@@ -342,26 +370,26 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
         // If instruction I reads or modifies Reg, add it to UsedCSRegs,
         // CSRUsed map for the current block.
         if (I->readsRegister(Reg, TRI) || I->modifiesRegister(Reg, TRI)) {
-          UsedCSRegs.set(Reg);
-          CSRUsed[MBB].set(Reg);
+          UsedCSRegs.set(i);
+          CSRUsed[MBB].set(i);
           // Short-circuit analysis for entry, return blocks:
           // if a CSR is used in the entry block, add it directly
           // to CSRSave[entryBlock] and to returnBlocks.
           // Check for a CSR use in a non-entry block.
           if (MBB->getNumber() == entryBlock->getNumber()) {
-            CSRSave[MBB].set(Reg);
-            for (unsigned i = 0; i < returnBlocks.size(); ++i)
-              CSRRestore[returnBlocks[i]].set(Reg);
+            CSRSave[MBB].set(i);
+            for (unsigned ii = 0; ii < returnBlocks.size(); ++ii)
+              CSRRestore[returnBlocks[ii]].set(i);
           } else
             allCSRegUsesInEntryBlock = false;
         }
       }
     }
     DOUT << "CSRUsed[" << MBB->getBasicBlock()->getName() << "] = "
-         << stringifyCSRegSet(CSRUsed[MBB], TRI) << "\n";
+         << stringifyCSRegSet(CSRUsed[MBB], Fn) << "\n";
   }
 
-  DOUT << "UsedCSRegs = " << stringifyCSRegSet(UsedCSRegs, TRI) << "\n";
+  DOUT << "UsedCSRegs = " << stringifyCSRegSet(UsedCSRegs, Fn) << "\n";
 
   // If all uses of CSRegs are in the entry block, nothing to do:
   // spills go in entry block, restores go in exiting blocks.
@@ -387,9 +415,9 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
     AnticIn[MBB] = CSRegSetUnion(CSRUsed[MBB], AnticOut[MBB]);
 
     DOUT << "ANTIC_IN[" << MBB->getBasicBlock()->getName() << "] = "
-         << stringifyCSRegSet(AnticIn[MBB], TRI)
+         << stringifyCSRegSet(AnticIn[MBB], Fn)
          << "  ANTIC_OUT[" << MBB->getBasicBlock()->getName() << "] = "
-         << stringifyCSRegSet(AnticOut[MBB], TRI) << "\n";
+         << stringifyCSRegSet(AnticOut[MBB], Fn) << "\n";
   }
 
   DOUT << "-----------------------------------------------------------\n";
@@ -410,9 +438,9 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
     AvailOut[MBB] = CSRegSetUnion(CSRUsed[MBB], AvailIn[MBB]);
 
     DOUT << "AVAIL_IN[" << MBB->getBasicBlock()->getName() << "] = "
-               << stringifyCSRegSet(AvailIn[MBB], TRI)
+               << stringifyCSRegSet(AvailIn[MBB], Fn)
                << "  AVAIL_OUT[" << MBB->getBasicBlock()->getName() << "] = "
-               << stringifyCSRegSet(AvailOut[MBB], TRI) << "\n";
+               << stringifyCSRegSet(AvailOut[MBB], Fn) << "\n";
   }
 
   DOUT << "-----------------------------------------------------------\n";
@@ -453,7 +481,7 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
           assert(LPH && "Loop has no top level preheader?");
 
           DOUT << "Moving saves of "
-               << stringifyCSRegSet(CSRSave[MBB], TRI)
+               << stringifyCSRegSet(CSRSave[MBB], Fn)
                << " from " << MBB->getBasicBlock()->getName()
                << " to " << LPH->getBasicBlock()->getName() << "\n";
           // Add CSRegSet from MBB to LPH, empty out MBB's CSRegSet.
@@ -469,7 +497,7 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
 
     if (! CSRSave[MBB].empty())
       DOUT << "SAVE[" << MBB->getBasicBlock()->getName() << "] = "
-           << stringifyCSRegSet(CSRSave[MBB], TRI) << "\n";
+           << stringifyCSRegSet(CSRSave[MBB], Fn) << "\n";
   }
 
   DOUT << "-----------------------------------------------------------\n";
@@ -522,7 +550,7 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
             MachineBasicBlock* EXB = exitBlocks[i];
 
             DOUT << "Moving restores of "
-                 << stringifyCSRegSet(CSRRestore[MBB], TRI)
+                 << stringifyCSRegSet(CSRRestore[MBB], Fn)
                  << " from " << MBB->getBasicBlock()->getName()
                  << " to " << EXB->getBasicBlock()->getName() << "\n";
 
@@ -535,7 +563,7 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
     }
     if (! CSRRestore[MBB].empty())
       DOUT << "RESTORE[" << MBB->getBasicBlock()->getName() << "] = "
-           << stringifyCSRegSet(CSRRestore[MBB], TRI) << "\n";
+           << stringifyCSRegSet(CSRRestore[MBB], Fn) << "\n";
   }
 
   // DEBUG -- dump final Save, Restore maps.
@@ -546,7 +574,7 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
        MBB != E; ++MBB) {
     if (! CSRSave[MBB].empty()) {
       DOUT << "SAVE[" << MBB->getBasicBlock()->getName() << "] = "
-           << stringifyCSRegSet(CSRSave[MBB], TRI);
+           << stringifyCSRegSet(CSRSave[MBB], Fn);
       if (CSRRestore[MBB].empty())
         DOUT << "\n";
     }
@@ -554,7 +582,7 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
       if (! CSRSave[MBB].empty())
         DOUT << "    ";
       DOUT << "RESTORE[" << MBB->getBasicBlock()->getName() << "] = "
-           << stringifyCSRegSet(CSRRestore[MBB], TRI) << "\n";
+           << stringifyCSRegSet(CSRRestore[MBB], Fn) << "\n";
     }
   }
 }
@@ -712,21 +740,16 @@ void PEI::saveCalleeSavedRegisters(MachineFunction &Fn) {
 
       if (! save.empty()) {
         DOUT << "CSRSave[" << MBB->getBasicBlock()->getName() << "] = "
-             << stringifyCSRegSet(save, TRI) << "\n";
+             << stringifyCSRegSet(save, Fn) << "\n";
 
         blockCSI.clear();
         for (CSRegSet::iterator RI = save.begin(),
                RE = save.end(); RI != RE; ++RI) {
-          for (unsigned i = 0; i < CSI.size(); ++i)
-            if (CSI[i].getReg() == *RI) {
-
-              DOUT << "adding save of "
-                   << *RI << "(" << TRI->getName(*RI) << ") to blockCSI for "
-                   << MBB->getBasicBlock()->getName() << "\n";
-
-              blockCSI.push_back(CSI[i]);
-              break;
-            }
+          unsigned reg = CSI[*RI].getReg();
+          DOUT << "adding save of "
+               << reg << "(" << TRI->getName(reg) << ") to blockCSI for "
+               << MBB->getBasicBlock()->getName() << "\n";
+          blockCSI.push_back(CSI[*RI]);
         }
         assert(blockCSI.size() > 0 &&
                "Could not find callee saved register info");
@@ -755,22 +778,16 @@ void PEI::saveCalleeSavedRegisters(MachineFunction &Fn) {
 
       if (! restore.empty()) {
         DOUT << "CSRRestore[" << MBB->getBasicBlock()->getName() << "] = "
-             << stringifyCSRegSet(restore, TRI) << "\n";
+             << stringifyCSRegSet(restore, Fn) << "\n";
 
         blockCSI.clear();
         for (CSRegSet::iterator RI = restore.begin(),
                RE = restore.end(); RI != RE; ++RI) {
-
-          for (unsigned i = 0; i < CSI.size(); ++i)
-            if (CSI[i].getReg() == *RI) {
-
-              DOUT << "adding restore of "
-                   << *RI << "(" << TRI->getName(*RI) << ") to blockCSI for "
-                   << MBB->getBasicBlock()->getName() << "\n";
-
-              blockCSI.push_back(CSI[i]);
-              break;
-            }
+          unsigned reg = CSI[*RI].getReg();
+          DOUT << "adding restore of "
+               << reg << "(" << TRI->getName(reg) << ") to blockCSI for "
+               << MBB->getBasicBlock()->getName() << "\n";
+          blockCSI.push_back(CSI[*RI]);
         }
         assert(blockCSI.size() > 0 &&
                "Could not find callee saved register info");
@@ -778,16 +795,29 @@ void PEI::saveCalleeSavedRegisters(MachineFunction &Fn) {
         I = MBB->end();
         --I;
 
-        // Skip over all terminator instructions, which are part of the return
-        // sequence.
-        MachineBasicBlock::iterator I2 = I;
-        while (I2 != MBB->begin() && (--I2)->getDesc().isTerminator())
-          I = I2;
+        // EXP append restore to block unless it ends in a
+        // barrier terminator instruction.
+
+        // Skip over all terminator instructions, which are part of the
+        // return sequence.
+        if (I->getDesc().isCall()) {
+          ++I;
+        } else {
+          MachineBasicBlock::iterator I2 = I;
+          while (I2 != MBB->begin() && (--I2)->getDesc().isTerminator())
+            I = I2;
+        }
 
         bool AtStart = I == MBB->begin();
         MachineBasicBlock::iterator BeforeI = I;
         if (!AtStart)
           --BeforeI;
+
+        // DEBUG
+        MachineInstr* MI = BeforeI;
+        DOUT << "adding restore after ";
+        MI->dump();
+        // DEBUG
 
         // Restore all registers immediately before the return and any
         // terminators that preceed it.
@@ -1046,6 +1076,28 @@ void PEI::calculateFrameObjectOffsets(MachineFunction &Fn) {
 void PEI::insertPrologEpilogCode(MachineFunction &Fn) {
   const TargetRegisterInfo *TRI = Fn.getTarget().getRegisterInfo();
 
+  // EXP adjust stack size to account for CSR spills that have been
+  // moved by shrink wrapping out of the entry block.
+  uint64_t stackSize = Fn.getFrameInfo()->getStackSize();
+  bool adjustedStack = false;
+  if (UsedCSRegs.count()) {
+    const std::vector<CalleeSavedInfo> &CSI =
+      Fn.getFrameInfo()->getCalleeSavedInfo();
+    unsigned stackAdj = 0;
+    MachineFunction::iterator BB = Fn.begin();
+    if (BB->pred_size() == 0 && CSRSave[BB].empty()) {
+      for (CSRegSet::iterator RI = UsedCSRegs.begin(),
+             RE = UsedCSRegs.end(); RI != RE; ++RI) {
+        stackAdj += CSI[*RI].getRegClass()->getSize();
+      }
+      DOUT << "Adjusting stack for pro/epi in function "
+           << Fn.getFunction()->getName() << " to "
+           << stackSize+stackAdj << "\n";
+      Fn.getFrameInfo()->setStackSize(stackSize + stackAdj);
+      adjustedStack = true;
+    }
+  }
+
   // Add prologue to the function...
   TRI->emitPrologue(Fn);
 
@@ -1054,6 +1106,13 @@ void PEI::insertPrologEpilogCode(MachineFunction &Fn) {
     // If last instruction is a return instruction, add an epilogue
     if (!I->empty() && I->back().getDesc().isReturn())
       TRI->emitEpilogue(Fn, *I);
+  }
+
+  // EXP restore stack size.
+  if (adjustedStack) {
+    DOUT << "Restoring stack for pro/epi in function "
+         << Fn.getFunction()->getName() << " to " << stackSize << "\n";
+    Fn.getFrameInfo()->setStackSize(stackSize);
   }
 }
 
@@ -1073,9 +1132,56 @@ void PEI::replaceFrameIndices(MachineFunction &Fn) {
   int FrameSetupOpcode   = TRI.getCallFrameSetupOpcode();
   int FrameDestroyOpcode = TRI.getCallFrameDestroyOpcode();
 
-  for (MachineFunction::iterator BB = Fn.begin(), E = Fn.end(); BB != E; ++BB) {
+  DOUT << "Replacing frame indices for: "
+       << Fn.getFunction()->getName() << "\n";
+
+  // TODO -- here: save stack adj for spill in BB of CSRs that
+  //   will be used in other BBs. When the using BBs are processed,
+  //   find the stack adj in the StackAdj map.
+  uint64_t savedStackSize = Fn.getFrameInfo()->getStackSize();
+#if 0
+  DenseMap<MachineBasicBlock*, int> StackAdj;
+  for (MachineFunction::iterator BB = Fn.begin(),
+         E = Fn.end(); BB != E; ++BB) {
+    uint64_t adjStackSize = 0;
+    bool inEntryBlock = BB->pred_size() == 0;
+    if (UsedCSRegs.count()) {
+      int stackAdj = 0;
+      unsigned numCSR = CSRSave[BB].count();
+      DOUT << "MBB: " << BB->getBasicBlock()->getName()
+           << " has " << numCSR << " CSR saves\n";
+      if (! inEntryBlock && (numCSR > 0)) {
+        stackAdj = numCSR * 4; // FIXME: slot size.
+        StackAdj[BB] = stackAdj;
+      }
+    }
+  }
+#endif
+
+  for (MachineFunction::iterator BB = Fn.begin(),
+         E = Fn.end(); BB != E; ++BB) {
     int SPAdj = 0;  // SP offset due to call frame setup / destroy.
     if (RS) RS->enterBasicBlock(BB);
+
+    uint64_t adjStackSize = 0;
+    bool inEntryBlock = BB->pred_size() == 0;
+    if (UsedCSRegs.count() && ! inEntryBlock) {
+      const std::vector<CalleeSavedInfo> &CSI =
+        Fn.getFrameInfo()->getCalleeSavedInfo();
+      int stackAdj = 0;
+
+      for (CSRegSet::iterator RI = CSRSave[BB].begin(),
+             RE = CSRSave[BB].end(); RI != RE; ++RI) {
+        stackAdj += CSI[*RI].getRegClass()->getSize();
+      }
+
+      if (stackAdj > 0) {
+        adjStackSize = savedStackSize + stackAdj;
+        DOUT << "Adjusting stack size " << savedStackSize
+             << " by " << stackAdj << " to " << adjStackSize << "\n";
+      }
+    }
+
     for (MachineBasicBlock::iterator I = BB->begin(); I != BB->end(); ) {
       MachineInstr *MI = I;
 
@@ -1126,7 +1232,24 @@ void PEI::replaceFrameIndices(MachineFunction &Fn) {
           // If this instruction has a FrameIndex operand, we need to
           // use that target machine register info object to eliminate
           // it.
+
+          // EXP adjust stack size to account for CSR spills in non-entry
+          // blocks, so that FI operands will get correct stack offsets.
+          bool adjustedStack = false;
+          if (adjStackSize != 0) {
+            Fn.getFrameInfo()->setStackSize(adjStackSize);
+            adjustedStack = true;
+            DOUT << "Adjusted stack size to " << adjStackSize << " in ";
+            MI->dump();
+          }
+
           TRI.eliminateFrameIndex(MI, SPAdj, RS);
+
+          // EXP restore stack size.
+          if (adjustedStack) {
+            Fn.getFrameInfo()->setStackSize(savedStackSize);
+            DOUT << "Restored stack size to " << savedStackSize << "\n";
+          }
 
           // Reset the iterator if we were at the beginning of the BB.
           if (AtBeginning) {
