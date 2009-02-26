@@ -157,11 +157,12 @@ namespace {
     // stack frame indexes.
     unsigned MinCSFrameIndex, MaxCSFrameIndex;
 
-    // Analysis info for placing callee saved register saves/restores.
+    // Analysis info for spill/restore placement.
+    // "CSR" abbreviates "callee saved register".
 
     // CSRegSet contains indices into the Callee Saved Register Info
     // vector built by calculateCalleeSavedRegisters() and accessed
-    // via Fn.getFrameInfo()->getCalleeSavedInfo().
+    // via MF.getFrameInfo()->getCalleeSavedInfo().
     typedef SparseBitVector<> CSRegSet;
 
     // CSRegBlockMap maps MachineBasicBlocks to sets of callee
@@ -171,13 +172,20 @@ namespace {
     // Set and maps for callee saved registers:
     //  used in function (UsedCSRegs)
     //  used in a basic block (CSRUsed)
+    //  anticipatable in a basic block (Antic{In,Out})
+    //  available in a basic block (Avail{In,Out})
     //  to be spilled at the entry to a basic block (CSRSave)
     //  to be restored at the end of a basic block (CSRRestore)
+
     CSRegSet UsedCSRegs;
     CSRegBlockMap CSRUsed;
+    CSRegBlockMap AnticIn, AnticOut;
+    CSRegBlockMap AvailIn, AvailOut;
     CSRegBlockMap CSRSave;
     CSRegBlockMap CSRRestore;
 
+    bool calculateUsedAnticAvail(MachineFunction &Fn);
+    void placeSpillsAndRestores(MachineFunction &Fn);
     void placeCSRSpillsAndRestores(MachineFunction &Fn);
 
     void calculateCalleeSavedRegisters(MachineFunction &Fn);
@@ -188,16 +196,10 @@ namespace {
 
     // Convienences used by placeCSRSpillsAndRestores().
 
+    // FIXME: because SparseBitVector has no clear() method.
     void clearCSRegSet(CSRegSet& s) {
       CSRegSet emptySet;
       s &= emptySet;
-    }
-
-    void clearSets() {
-      clearCSRegSet(UsedCSRegs);
-      CSRUsed.clear();
-      CSRSave.clear();
-      CSRRestore.clear();
     }
 
     // Because SparseBitVector has no _infix_ operator|&-()...
@@ -217,6 +219,17 @@ namespace {
       CSRegSet result;
       result.intersectWithComplement(s1, s2);
       return result;
+    }
+
+    void clearSets() {
+      clearCSRegSet(UsedCSRegs);
+      CSRUsed.clear();
+      AnticIn.clear();
+      AnticOut.clear();
+      AvailIn.clear();
+      AvailOut.clear();
+      CSRSave.clear();
+      CSRRestore.clear();
     }
 
     MachineBasicBlock* getTopLevelLoopPreheader(MachineLoop* LP) {
@@ -290,78 +303,33 @@ namespace {
 FunctionPass *llvm::createPrologEpilogCodeInserter() { return new PEI(); }
 
 
-/// placeCSRSpillsAndRestores - determine which MBBs of the function
-/// need save, restore code for callee-saved registers by doing a DF analysis
-/// similar to the one used in code motion (GVNPRE). This produces maps of MBBs
-/// to sets of registers (CSRs) for saves and restores. MachineLoopInfo
-/// is used to ensure that CSR save/restore code is not placed inside loops.
+/// Helper function for placeCSRSpillsAndRestores
 ///
-void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
+bool PEI::calculateUsedAnticAvail(MachineFunction &Fn) {
 
   // Sets used to compute spill, restore placement sets.
-  CSRegBlockMap AnticIn, AnticOut;
-  CSRegBlockMap AvailIn, AvailOut;
   const std::vector<CalleeSavedInfo> CSI =
     Fn.getFrameInfo()->getCalleeSavedInfo();
-
-  DOUT << "Place CSR spills/restores for "
-       << Fn.getFunction()->getName() << "\n";
-
-  // Clear Save, Restore sets.
-  clearSets();
 
   // If no CSRs used, we are done.
   if (CSI.empty()) {
     DOUT << Fn.getFunction()->getName()
          << " uses no callee-saved registers.\n";
-    return;
+    return false;
   }
-
-  MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();
-  MachineLoopInfo &LI = getAnalysis<MachineLoopInfo>();
 
   const TargetRegisterInfo *TRI = Fn.getTarget().getRegisterInfo();
   bool allCSRegUsesInEntryBlock = true;
 
-  // DEBUG -- dump loop info
-  DOUT << "Top level loops of " << Fn.getFunction()->getName() << ":\n";
-  for (MachineLoopInfo::iterator
-         I = LI.begin(), E = LI.end(); I != E; ++I) {
-    MachineLoop* LP = *I;
-    MachineBasicBlock* HDR = LP->getHeader();
-    MachineBasicBlock* PHDR = LP->getLoopPreheader();
-    SmallVector<MachineBasicBlock*, 4> loopExits;
-
-    LP->getExitingBlocks(loopExits);
-
-    DOUT << " Loop with header "
-         << getBasicBlockName(HDR);
-    if (PHDR) {
-      DOUT << " and preheader " << getBasicBlockName(PHDR);
-    }
-    DOUT << " has exiting blocks:";
-    for (unsigned i = 0; i < loopExits.size(); ++i) {
-      DOUT << " " << getBasicBlockName(loopExits[i]);
-    }
-    loopExits.clear();
-    LP->getExitBlocks(loopExits);
-    DOUT << " and exit blocks:";
-    for (unsigned i = 0; i < loopExits.size(); ++i) {
-      DOUT << " " << getBasicBlockName(loopExits[i]);
-    }
-    DOUT << "\n";
-  }
-  // DEBUG -- dump loop info
-
-  // 0. Initialize UsedCSRegs set, CSRUsed map.
-  //    At the same time, put entry block directly into
-  //    CSRSave, CSRRestore sets if any CSRs are used.
+  // Initialize UsedCSRegs set, CSRUsed map.
+  // At the same time, put entry block directly into
+  // CSRSave, CSRRestore sets if any CSRs are used.
   //
-  //    Quick exit option:
-  //    If there is at least one use in entry block,
-  //    revert to default behavior, skip the placement
-  //    step and put all saves in entry, restores in
-  //    return blocks.
+  // Quick exit option (not implemented):
+  //   If there N CSR uses in entry block,
+  //   revert to default behavior, skip the placement
+  //   step and put all saves in entry, restores in
+  //   return blocks.
   SmallVector<MachineBasicBlock*, 4> returnBlocks;
   MachineBasicBlock* entryBlock;
   for (MachineFunction::iterator MBB = Fn.begin(), E = Fn.end();
@@ -406,8 +374,10 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
   // spills go in entry block, restores go in exiting blocks.
   if (allCSRegUsesInEntryBlock) {
     DOUT << "All uses of CSRegs are in entry block, nothing to do.\n";
-    return;
+    return false;
   }
+
+  MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();
 
   DOUT << "Computing {ANTIC,AVAIL}_{IN,OUT} sets\n";
 
@@ -457,6 +427,28 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
 
   DOUT << "-----------------------------------------------------------\n";
 
+  return true;
+}
+
+void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
+
+  MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();
+  MachineLoopInfo &LI = getAnalysis<MachineLoopInfo>();
+
+  DOUT << "Computing SAVE, RESTORE sets\n";
+
+  // FIXME: factor this
+  SmallVector<MachineBasicBlock*, 4> returnBlocks;
+  MachineBasicBlock* entryBlock;
+  for (MachineFunction::iterator MBB = Fn.begin(), E = Fn.end();
+       MBB != E; ++MBB)
+    // Save entry block, return blocks.
+    if (MBB->pred_size() == 0)
+      entryBlock = MBB;
+    else
+      if (!MBB->empty() && MBB->back().getDesc().isReturn())
+        returnBlocks.push_back(MBB);
+
   // Calculate CSRSave via top-down walk of Machine dominator tree.
   for (df_iterator<MachineDomTreeNode*> DI = df_begin(DT.getRootNode()),
          E = df_end(DT.getRootNode()); DI != E; ++DI) {
@@ -487,6 +479,9 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
       // Move saves inside loops to the preheaders of the outermost (top level)
       // containing loops.
       if (! CSRSave[MBB].empty()) {
+        // Vector of blocks at which restores have been placed, for
+        // processing paths that need saves to cover saves placed at
+        // branch points.
         SmallVector<MachineBasicBlock*, 4> restoreBlocks;
         if (MachineLoop* LP = LI.getLoopFor(MBB)) {
           MachineBasicBlock* LPH = getTopLevelLoopPreheader(LP);
@@ -505,14 +500,16 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
           } else {
             // Remember where we moved the save so we can add
             // restores on successor paths if necessary.
+            // Check for branch point
             restoreBlocks.push_back(LPH);
           }
           clearCSRegSet(CSRSave[MBB]);
-        } else
+        } else // Check for branch point
           restoreBlocks.push_back(MBB);
-        // Add restores to successor edges of blocks that need them.
-        // try to find a successor of MBB s.t. no paths below it in
-        // the CFG have uses of any CSRs saved in MBB.
+        // FIXME: Confusing, clarify:
+        // Add restores of CSRs saved in branch point MBBs to the
+        // front of any succ blocks flowing into regions that
+        // have no uses of MBB's CSRs.
         for (unsigned i = 0; i < restoreBlocks.size(); ++i) {
           MachineBasicBlock* BB = restoreBlocks[i];
           if (BB->succ_size() > 1) {
@@ -609,9 +606,10 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
           clearCSRegSet(CSRRestore[MBB]);
         } else
           saveBlocks.push_back(MBB);
-        // Add saves of CSRs restored in MBB to the ends
-        // of any pred blocks that reach MBB through paths
-        // that don't use MBB's CSRs.
+        // FIXME: Confusing, clarify:
+        // Add saves of CSRs restored in join point MBBs to the ends
+        // of any pred blocks that flow into MBB from regions that
+        // have no uses of MBB's CSRs.
         for (unsigned i = 0; i < saveBlocks.size(); ++i) {
           MachineBasicBlock* BB = saveBlocks[i];
           if (BB->pred_size() > 1) {
@@ -619,9 +617,9 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
                    PE = BB->pred_end(); PI != PE; ++PI) {
               MachineBasicBlock* PRED = *PI;
               bool needsSave = false;
-              // FIXME -- need to walk from the preds of MBB,
-              //  need inverse DF iterator on MBBs, but idf_iterator
-              //  doesn't seem to work for MachineBasicBlock.
+              // FIXME -- need to walk back up in the CFG from the
+              // preds of MBB, need inverse DF iterator on MBBs,
+              // but idf_iterator doesn't seem to work for MachineBasicBlock.
               if (!CSRUsed[PRED].intersects(CSRRestore[BB]) &&
                   (PRED->succ_size() == 1 || !LI.getLoopFor(PRED)))
                 needsSave = true;
@@ -642,7 +640,6 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
            << stringifyCSRegSet(CSRRestore[MBB], Fn) << "\n";
   }
 
-  // DEBUG -- dump final Save, Restore maps.
   DOUT << "-----------------------------------------------------------\n";
   DOUT << "Final SAVE, RESTORE:\n";
   DOUT << "-----------------------------------------------------------\n";
@@ -660,6 +657,26 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
       DOUT << "RESTORE[" << getBasicBlockName(MBB) << "] = "
            << stringifyCSRegSet(CSRRestore[MBB], Fn) << "\n";
     }
+  }
+
+}
+
+/// placeCSRSpillsAndRestores - determine which MBBs of the function
+/// need save, restore code for callee-saved registers by doing a DF analysis
+/// similar to the one used in code motion (GVNPRE). This produces maps of MBBs
+/// to sets of registers (CSRs) for saves and restores. MachineLoopInfo
+/// is used to ensure that CSR save/restore code is not placed inside loops.
+///
+void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
+
+  DOUT << "Place CSR spills/restores for "
+       << Fn.getFunction()->getName() << "\n";
+
+  // Clear all sets.
+  clearSets();
+
+  if (calculateUsedAnticAvail(Fn)) {
+    placeSpillsAndRestores(Fn);
   }
 }
 
@@ -1188,7 +1205,7 @@ void PEI::insertPrologEpilogCode(MachineFunction &Fn) {
   // moved by shrink wrapping out of the entry block.
   uint64_t stackSize = Fn.getFrameInfo()->getStackSize();
   bool adjustedStack = false;
-  if (UsedCSRegs.count()) {
+  if (ShrinkWrapping && UsedCSRegs.count()) {
     const std::vector<CalleeSavedInfo> &CSI =
       Fn.getFrameInfo()->getCalleeSavedInfo();
     unsigned stackAdj = 0;
@@ -1217,7 +1234,7 @@ void PEI::insertPrologEpilogCode(MachineFunction &Fn) {
   }
 
   // EXP restore stack size.
-  if (adjustedStack) {
+  if (ShrinkWrapping && adjustedStack) {
     DOUT << "Restoring stack for pro/epi in function "
          << Fn.getFunction()->getName() << " to " << stackSize << "\n";
     Fn.getFrameInfo()->setStackSize(stackSize);
@@ -1240,46 +1257,47 @@ void PEI::replaceFrameIndices(MachineFunction &Fn) {
   int FrameSetupOpcode   = TRI.getCallFrameSetupOpcode();
   int FrameDestroyOpcode = TRI.getCallFrameDestroyOpcode();
 
-  DOUT << "Replacing frame indices for: "
-       << Fn.getFunction()->getName() << "\n";
-
-  // Save stack adj for spill in BB of CSRs that
-  // will be used in other BBs. When the using BBs are processed,
-  // find the stack adj in the StackAdj map.
   uint64_t savedStackSize = Fn.getFrameInfo()->getStackSize();
   DenseMap<MachineBasicBlock*, int> StackAdjBlocks;
-  MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();
-  for (MachineFunction::iterator BB = Fn.begin(),
-         E = Fn.end(); BB != E; ++BB) {
-    int stackAdj = 0;
-    MachineBasicBlock* entry;
-    MachineBasicBlock* MBB = BB;
-    if (BB->pred_size() == 0)
-      entry = BB;
-    if (BB->pred_size() > 0 && ! CSRSave[BB].empty()) {
-      const std::vector<CalleeSavedInfo> &CSI =
-        Fn.getFrameInfo()->getCalleeSavedInfo();
-      // get this block's stack adj from its saved regs
-      stackAdj = 0;
-      for (CSRegSet::iterator RI = CSRSave[BB].begin(),
-             RE = CSRSave[BB].end(); RI != RE; ++RI) {
-        stackAdj += CSI[*RI].getRegClass()->getSize();
-      }
-      // Add this block and all of its descendents in
-      // the machine dominator tree to the map.
-      StackAdjBlocks[BB] = stackAdj;
-      DOUT << "Processing " << getBasicBlockName(BB)
-           << " for stack adjustment\n";
-      if (! CSRSave[entry].empty()) {
-        DOUT << "Processing DT descendents of " << getBasicBlockName(BB)
-             << " stack adjustment:\n";
-        for (df_iterator<MachineBasicBlock*> BI = df_begin(MBB),
-               BE = df_end(MBB); BI != BE; ++BI) {
-          MachineBasicBlock* SBB = *BI;
-          if (DT.dominates(MBB, SBB)) {
-            DOUT << "  " << getBasicBlockName(SBB)
-                 << " will be adjusted.\n";
-            StackAdjBlocks[SBB] = stackAdj;
+  if (ShrinkWrapping) {
+    DOUT << "Replacing frame indices for: "
+         << Fn.getFunction()->getName() << "\n";
+    // Save stack adj for spill in BB of CSRs that
+    // will be used in other BBs. When the using BBs are processed,
+    // find the stack adj in the StackAdj map.
+    MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();
+    for (MachineFunction::iterator BB = Fn.begin(),
+           E = Fn.end(); BB != E; ++BB) {
+      int stackAdj = 0;
+      MachineBasicBlock* entry;
+      MachineBasicBlock* MBB = BB;
+      if (BB->pred_size() == 0)
+        entry = BB;
+      if (BB->pred_size() > 0 && ! CSRSave[BB].empty()) {
+        const std::vector<CalleeSavedInfo> &CSI =
+          Fn.getFrameInfo()->getCalleeSavedInfo();
+        // get this block's stack adj from its saved regs
+        stackAdj = 0;
+        for (CSRegSet::iterator RI = CSRSave[BB].begin(),
+               RE = CSRSave[BB].end(); RI != RE; ++RI) {
+          stackAdj += CSI[*RI].getRegClass()->getSize();
+        }
+        // Add this block and all of its descendents in
+        // the machine dominator tree to the map.
+        StackAdjBlocks[BB] = stackAdj;
+        DOUT << "Processing " << getBasicBlockName(BB)
+             << " for stack adjustment\n";
+        if (! CSRSave[entry].empty()) {
+          DOUT << "Processing DT descendents of " << getBasicBlockName(BB)
+               << " stack adjustment:\n";
+          for (df_iterator<MachineBasicBlock*> BI = df_begin(MBB),
+                 BE = df_end(MBB); BI != BE; ++BI) {
+            MachineBasicBlock* SBB = *BI;
+            if (DT.dominates(MBB, SBB)) {
+              DOUT << "  " << getBasicBlockName(SBB)
+                   << " will be adjusted.\n";
+              StackAdjBlocks[SBB] = stackAdj;
+            }
           }
         }
       }
@@ -1292,12 +1310,14 @@ void PEI::replaceFrameIndices(MachineFunction &Fn) {
     if (RS) RS->enterBasicBlock(BB);
 
     uint64_t adjStackSize = 0;
-    int stackAdj = 0;
-    if ((stackAdj = StackAdjBlocks[BB]) > 0) {
-      adjStackSize = savedStackSize + stackAdj;
-      DOUT << "MBB: " << getBasicBlockName(BB)
-           << " adjusting stack size " << savedStackSize
-           << " by " << stackAdj << " to " << adjStackSize << "\n";
+    if (ShrinkWrapping) {
+      int stackAdj = StackAdjBlocks[BB];
+      if (stackAdj != 0) {
+        adjStackSize = savedStackSize + stackAdj;
+        DOUT << "MBB: " << getBasicBlockName(BB)
+             << " adjusting stack size " << savedStackSize
+             << " by " << stackAdj << " to " << adjStackSize << "\n";
+      }
     }
 
     for (MachineBasicBlock::iterator I = BB->begin(); I != BB->end(); ) {
@@ -1353,20 +1373,15 @@ void PEI::replaceFrameIndices(MachineFunction &Fn) {
 
           // EXP adjust stack size to account for CSR spills in non-entry
           // blocks, so that FI operands will get correct stack offsets.
-          bool adjustedStack = false;
-          if (adjStackSize != 0) {
+          if (ShrinkWrapping && adjStackSize != 0) {
             Fn.getFrameInfo()->setStackSize(adjStackSize);
-            adjustedStack = true;
-            DOUT << "Adjusted stack size to " << adjStackSize << " in ";
-            MI->dump();
           }
 
           TRI.eliminateFrameIndex(MI, SPAdj, RS);
 
           // EXP restore stack size.
-          if (adjustedStack) {
+          if (ShrinkWrapping && adjStackSize != 0) {
             Fn.getFrameInfo()->setStackSize(savedStackSize);
-            DOUT << "Restored stack size to " << savedStackSize << "\n";
           }
 
           // Reset the iterator if we were at the beginning of the BB.
