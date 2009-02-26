@@ -1293,7 +1293,9 @@ void PEI::replaceFrameIndices(MachineFunction &Fn) {
           for (df_iterator<MachineBasicBlock*> BI = df_begin(MBB),
                  BE = df_end(MBB); BI != BE; ++BI) {
             MachineBasicBlock* SBB = *BI;
-            if (DT.dominates(MBB, SBB)) {
+            if (DT.dominates(MBB, SBB) &&
+                ! CSRRestore[SBB].intersects(CSRSave[BB]) &&
+                SBB->succ_size() > 0) {
               DOUT << "  " << getBasicBlockName(SBB)
                    << " will be adjusted.\n";
               StackAdjBlocks[SBB] = stackAdj;
