@@ -545,7 +545,6 @@ MachineBasicBlock* PEI::moveSpillsOutOfLoops(MachineFunction &Fn,
 /// addRestoresForSBranchBlock - helper for placeSpillsAndRestores() which
 /// determines when a restore should be placed on a path reached from a
 /// branch point that has a spill.
-/// TODO -- edge splitting applies.
 ///
 void PEI::addRestoresForSBranchBlock(MachineFunction &Fn,
                                      MachineBasicBlock* MBB) {
@@ -632,19 +631,11 @@ void PEI::addSavesForRJoinBlocks(MachineFunction& Fn,
 
   MachineLoopInfo &LI = getAnalysis<MachineLoopInfo>();
 
-  // EXP -- edge splitting solution.
-#if defined(SHRINK_WRAP_SPLIT_EDGES)
-  DenseMap<MachineBasicBlock*, MachineBasicBlock*> EdgeSplitMap;
-#endif
-
   // Add saves of CSRs restored in join point MBBs to the ends
   // of any pred blocks that flow into MBB from regions that
   // have no uses of MBB's CSRs.
   for (unsigned i = 0; i < SBLKS.size(); ++i) {
     MachineBasicBlock* BB = SBLKS[i];
-#if defined(SHRINK_WRAP_SPLIT_EDGES)
-    MachineBasicBlock* PREDSPL = 0;
-#endif
     if (BB->pred_size() > 1) {
       bool needsSave = false;
       for (MachineBasicBlock::pred_iterator PI = BB->pred_begin(),
@@ -656,11 +647,6 @@ void PEI::addSavesForRJoinBlocks(MachineFunction& Fn,
         if (!CSRUsed[PRED].intersects(CSRRestore[BB]) &&
             (PRED->succ_size() == 1 || !LI.getLoopFor(PRED)))
           needsSave = true;
-#if defined(SHRINK_WRAP_SPLIT_EDGES)
-        else if (!CSRUsed[PRED].intersects(CSRRestore[BB]) &&
-                 PRED->succ_size() > 1)
-          PREDSPL = PRED;
-#endif
         if (needsSave) {
           // Add saves to PRED for all CSRs restored in MBB...
 #ifndef NDEBUG
@@ -671,55 +657,8 @@ void PEI::addSavesForRJoinBlocks(MachineFunction& Fn,
           CSRSave[PRED] = CSRRestore[BB];
         }
       }
-#if defined(SHRINK_WRAP_SPLIT_EDGES)
-      if (needsSave && PREDSPL) {
-        // Remember <PRED,BB> so edge can be split...
-#ifndef NDEBUG
-        DOUT << "Splitting edge: " << getBasicBlockName(PREDSPL)
-             << " -> "
-             << getBasicBlockName(BB) << "\n";
-#endif
-        EdgeSplitMap[BB] = PREDSPL;
-      }
-#endif
     }
   }
-
-  // EXP -- edge splitting solution.
-#if defined(SHRINK_WRAP_SPLIT_EDGES)
-  // Split edges in EdgeSplitMap.
-  // TODO -- do edge splitting in the Machine CFG, regenerate
-  //   Machine dominator info, etc.
-  if (! EdgeSplitMap.empty()) {
-    const TargetInstrInfo &TII = *Fn.getTarget().getInstrInfo();
-    for (DenseMap<MachineBasicBlock*,MachineBasicBlock*>::iterator
-           BI = EdgeSplitMap.begin(),
-           BE = EdgeSplitMap.end(); BI != BE; ++BI) {
-      MachineBasicBlock* MBB = BI->first;
-      MachineBasicBlock* PRED = BI->second;
-      MachineBasicBlock* NBB;
-
-      // Break the edge from MBB -> SUCC, move restore from SUCC -> new MBB.
-      NBB = Fn.CreateMachineBasicBlock();
-      Fn.push_back(NBB);
-
-      // Remove the branch at the end of PRED.
-      TII.RemoveBranch(*PRED);
-      // Insert an unconditional branch to the new MBB at the end of PRED.
-      TII.InsertBranch(*PRED, NBB, 0, SmallVector<MachineOperand, 0>());
-      // Insert an unconditional branch into the new MBB.
-      TII.InsertBranch(*NBB, MBB, 0, SmallVector<MachineOperand, 0>());
-
-      PRED->addSuccessor(NBB);
-      PRED->removeSuccessor(MBB);
-      NBB->addSuccessor(MBB);
-      CSRRestore[NBB] = CSRRestore[MBB];
-      CSRRestore[MBB].clear();
-    }
-    EdgeSplitMap.clear();
-    Fn.RenumberBlocks();
-  }
-#endif
 }
 
 /// placeSpillsAndRestores - decide which MBBs need spills, restores
