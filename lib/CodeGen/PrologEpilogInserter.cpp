@@ -377,6 +377,10 @@ bool PEI::calculateUsedAnticAvail(MachineFunction &Fn) {
     return false;
   }
 
+#ifndef NDEBUG
+  DOUT << "-----------------------------------------------------------\n";
+#endif
+
   const TargetRegisterInfo *TRI = Fn.getTarget().getRegisterInfo();
   bool allCSRUsesInEntryBlock = true;
 
@@ -397,29 +401,40 @@ bool PEI::calculateUsedAnticAvail(MachineFunction &Fn) {
     if (!MBB->empty() && MBB->back().getDesc().isReturn())
       ReturnBlocks.push_back(MBB);
 
-  for (MachineFunction::iterator MBB = Fn.begin(), E = Fn.end();
-       MBB != E; ++MBB) {
+  for (MachineFunction::iterator MBBI = Fn.begin(), MBBE = Fn.end();
+       MBBI != MBBE; ++MBBI) {
+    MachineBasicBlock* MBB = MBBI;
     for (MachineBasicBlock::iterator I = MBB->begin(); I != MBB->end(); ++I) {
-      for (unsigned i = 0, e = CSI.size(); i != e; ++i) {
-        unsigned Reg = CSI[i].getReg();
-        //
-        // TODO -- here: rewrite to traverse operands directly:
-        //
+      for (unsigned inx = 0, e = CSI.size(); inx != e; ++inx) {
+        unsigned Reg = CSI[inx].getReg();
         // If instruction I reads or modifies Reg, add it to UsedCSRegs,
         // CSRUsed map for the current block.
-        if (I->readsRegister(Reg, TRI) || I->modifiesRegister(Reg, TRI)) {
-          UsedCSRegs.set(i);
-          CSRUsed[MBB].set(i);
-          // Short-circuit analysis for entry, return blocks:
-          // if a CSR is used in the entry block, add it directly
-          // to CSRSave[EntryBlock] and to ReturnBlocks.
-          // Check for a CSR use in a non-entry block.
-          if (MBB->getNumber() == EntryBlock->getNumber()) {
-            CSRSave[MBB].set(i);
-            for (unsigned ii = 0; ii < ReturnBlocks.size(); ++ii)
-              CSRRestore[ReturnBlocks[ii]].set(i);
-          } else
-            allCSRUsesInEntryBlock = false;
+        for (unsigned opInx = 0, opEnd = I->getNumOperands();
+             opInx != opEnd; ++opInx) {
+          const MachineOperand &MO = I->getOperand(opInx);
+          if (! (MO.isReg() && (MO.isUse() || MO.isDef())))
+            continue;
+          unsigned MOReg = MO.getReg();
+          if (!MOReg)
+            continue;
+          if (MOReg == Reg ||
+              (TargetRegisterInfo::isPhysicalRegister(MOReg) &&
+               TargetRegisterInfo::isPhysicalRegister(Reg) &&
+               TRI->isSubRegister(MOReg, Reg))) {
+            // CSR Reg is defined/used in block MBB.
+            UsedCSRegs.set(inx);
+            CSRUsed[MBB].set(inx);
+            // Short-circuit analysis for entry, return blocks:
+            // if a CSR is used in the entry block, add it directly
+            // to CSRSave[EntryBlock] and to CSRRestore[R] for R
+            // in ReturnBlocks. Note CSR uses in non-entry blocks.
+            if (MBB == EntryBlock) {
+              CSRSave[MBB].set(inx);
+              for (unsigned ri = 0, re = ReturnBlocks.size(); ri != re; ++ri)
+                CSRRestore[ReturnBlocks[ri]].set(inx);
+            } else
+              allCSRUsesInEntryBlock = false;
+          }
         }
       }
     }
@@ -443,6 +458,10 @@ bool PEI::calculateUsedAnticAvail(MachineFunction &Fn) {
     return false;
   }
 
+#ifndef NDEBUG
+  DOUT << "-----------------------------------------------------------\n";
+#endif
+
   MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();
 
   // Calculate AnticIn, AnticOut using post-order traversal of MCFG.
@@ -457,7 +476,7 @@ bool PEI::calculateUsedAnticAvail(MachineFunction &Fn) {
       MachineBasicBlock* SUCC = *SI;
       AnticOut[MBB] &= AnticIn[SUCC];
     }
-    // AnticIn[MBB] = CSRUsed[MBB] u AnticOut[MBB]
+    // AnticIn[MBB] = UNION(CSRUsed[MBB], AnticOut[MBB])
     AnticIn[MBB] = CSRUsed[MBB] | AnticOut[MBB];
 
 #ifndef NDEBUG
@@ -484,7 +503,7 @@ bool PEI::calculateUsedAnticAvail(MachineFunction &Fn) {
       MachineBasicBlock* PRED = *PI;
       AvailIn[MBB] &= AvailOut[PRED];
     }
-    // AvailIn[MBB] = CSRUsed[MBB] u AvailOut[MBB]
+    // AvailIn[MBB] = UNION(CSRUsed[MBB], AvailOut[MBB])
     AvailOut[MBB] = CSRUsed[MBB] | AvailIn[MBB];
 
 #ifndef NDEBUG
@@ -495,15 +514,13 @@ bool PEI::calculateUsedAnticAvail(MachineFunction &Fn) {
 #endif
   }
 
-#ifndef NDEBUG
-  DOUT << "-----------------------------------------------------------\n";
-#endif
-
   return true;
 }
 
 /// moveSpillsOutOfLoops - helper for placeSpillsAndRestores() which relocates
 ///  a spill from a subgraph in a loop to the loop preheader.
+/// Returns the MBB to which saves have been moved, or the given MBB
+/// if it is a branch point.
 ///
 MachineBasicBlock* PEI::moveSpillsOutOfLoops(MachineFunction &Fn,
                                              MachineBasicBlock* MBB) {
@@ -528,7 +545,7 @@ MachineBasicBlock* PEI::moveSpillsOutOfLoops(MachineFunction &Fn,
     CSRSave[LPH] |= CSRSave[MBB];
     // If saves moved to entry block, add restores to returns.
     if (LPH == EntryBlock) {
-      for (unsigned i = 0; i < ReturnBlocks.size(); ++i)
+      for (unsigned i = 0, e = ReturnBlocks.size(); i != e; ++i)
         CSRRestore[ReturnBlocks[i]] |= CSRSave[MBB];
     } else {
       // Remember where we moved the save so we can add
@@ -543,8 +560,8 @@ MachineBasicBlock* PEI::moveSpillsOutOfLoops(MachineFunction &Fn,
 }
 
 /// addRestoresForSBranchBlock - helper for placeSpillsAndRestores() which
-/// determines when a restore should be placed on a path reached from a
-/// branch point that has a spill.
+/// adds restores of CSRs saved in branch point MBBs to the front of any
+/// successor blocks connected to regions with no uses of the saved CSRs.
 ///
 void PEI::addRestoresForSBranchBlock(MachineFunction &Fn,
                                      MachineBasicBlock* MBB) {
@@ -582,7 +599,11 @@ void PEI::addRestoresForSBranchBlock(MachineFunction &Fn,
   }
 }
 
-/// moveRestoresOutOfLoops -
+/// moveRestoresOutOfLoops - helper for placeSpillsAndRestores() which
+/// relocates restores from a subgraph in a loop to the loop exit blocks.
+/// This function records the MBBs to which restores have been moved in
+/// SBLKS. If no restores are moved, SBLKS contains the input MBB if it
+/// is a join point in the Machine CFG.
 ///
 void PEI::moveRestoresOutOfLoops(MachineFunction& Fn,
                                  MachineBasicBlock* MBB,
@@ -603,7 +624,7 @@ void PEI::moveRestoresOutOfLoops(MachineFunction& Fn,
     LP->getExitBlocks(exitBlocks);
     assert(exitBlocks.size() > 0 &&
            "Loop has no top level exit blocks?");
-    for (unsigned i = 0; i < exitBlocks.size(); ++i) {
+    for (unsigned i = 0, e = exitBlocks.size(); i != e; ++i) {
       MachineBasicBlock* EXB = exitBlocks[i];
 
 #ifndef NDEBUG
@@ -623,38 +644,54 @@ void PEI::moveRestoresOutOfLoops(MachineFunction& Fn,
     SBLKS.push_back(MBB);
 }
 
+/// addSavesForRJoinBlocks - Add saves of CSRs restored in join point MBBs
+/// to the ends of any pred blocks that flow into MBB from regions that
+/// have no uses of MBB's CSRs.
+///
 void PEI::addSavesForRJoinBlocks(MachineFunction& Fn,
                                  std::vector<MachineBasicBlock*>& SBLKS) {
 
   if (SBLKS.empty())
     return;
 
+#if 0
   MachineLoopInfo &LI = getAnalysis<MachineLoopInfo>();
+#endif
 
-  // Add saves of CSRs restored in join point MBBs to the ends
-  // of any pred blocks that flow into MBB from regions that
-  // have no uses of MBB's CSRs.
-  for (unsigned i = 0; i < SBLKS.size(); ++i) {
-    MachineBasicBlock* BB = SBLKS[i];
-    if (BB->pred_size() > 1) {
+  for (unsigned i = 0, e = SBLKS.size(); i != e; ++i) {
+    MachineBasicBlock* MBB = SBLKS[i];
+    if (MBB->pred_size() > 1) {
       bool needsSave = false;
-      for (MachineBasicBlock::pred_iterator PI = BB->pred_begin(),
-             PE = BB->pred_end(); PI != PE; ++PI) {
+      for (MachineBasicBlock::pred_iterator PI = MBB->pred_begin(),
+             PE = MBB->pred_end(); PI != PE; ++PI) {
         MachineBasicBlock* PRED = *PI;
-        // FIXME -- need to walk back up in the CFG from the
-        // preds of MBB, need inverse DF iterator on MBBs,
-        // but idf_iterator doesn't seem to work for MachineBasicBlock.
-        if (!CSRUsed[PRED].intersects(CSRRestore[BB]) &&
+
+        // Walk back up in the CFG from the preds of MBB, look for
+        // a block that uses any CSR that is restored in MBB.
+        if (CSRUsed[PRED].intersects(CSRRestore[MBB]))
+          continue;
+        needsSave = true;
+        for (idf_iterator<MachineBasicBlock*> PPI = idf_begin(PRED),
+               PPE = idf_end(PRED); PPI != PPE; ++PPI) {
+          MachineBasicBlock* PBB = *PPI;
+          if (CSRUsed[PBB].intersects(CSRRestore[MBB])) {
+            needsSave = false;
+            break;
+          }
+        }
+#if 0
+        if (!CSRUsed[PRED].intersects(CSRRestore[MBB]) &&
             (PRED->succ_size() == 1 || !LI.getLoopFor(PRED)))
           needsSave = true;
+#endif
         if (needsSave) {
           // Add saves to PRED for all CSRs restored in MBB...
 #ifndef NDEBUG
-          DOUT << "MBB " << getBasicBlockName(BB)
+          DOUT << "MBB " << getBasicBlockName(MBB)
                << " needs a save on path from predecessor "
                << getBasicBlockName(PRED) << "\n";
 #endif
-          CSRSave[PRED] = CSRRestore[BB];
+          CSRSave[PRED] = CSRRestore[MBB];
         }
       }
     }
@@ -665,10 +702,6 @@ void PEI::addSavesForRJoinBlocks(MachineFunction& Fn,
 /// of CSRs.
 ///
 void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
-
-#ifndef NDEBUG
-  DOUT << "Computing SAVE, RESTORE sets\n";
-#endif
 
 #ifndef NDEBUG
   DOUT << "-----------------------------------------------------------\n";
@@ -778,7 +811,6 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
   }
 #endif
 }
-
 
 /// calculateCalleeSavedRegisters - Scan the function for modified callee saved
 /// registers.  Also calculate the MaxCallFrameSize and HasCalls variables for
