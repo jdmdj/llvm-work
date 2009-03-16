@@ -207,36 +207,7 @@ namespace {
     void replaceFrameIndices(MachineFunction &Fn);
     void insertPrologEpilogCode(MachineFunction &Fn);
 
-    // Convienences used by placeCSRSpillsAndRestores().
-
-#if 0
-    // FIXME: the following local CSRegSet methods will be added
-    //        to SparseBitVector.
-    void clearCSRegSet(CSRegSet& s) {
-      CSRegSet emptySet;
-      s = emptySet;
-    }
-
-    // Local supplements to SparseBitVector operators.
-    CSRegSet CSRegSetUnion(const CSRegSet& s1, const CSRegSet& s2) {
-      CSRegSet result(s1);
-      result |= s2;
-      return result;
-    }
-
-    CSRegSet CSRegSetIntersection(const CSRegSet& s1, const CSRegSet& s2) {
-      CSRegSet result(s1);
-      result &= s2;
-      return result;
-    }
-
-    CSRegSet CSRegSetDifference(const CSRegSet& s1, const CSRegSet& s2) {
-      CSRegSet result;
-      result.intersectWithComplement(s1, s2);
-      return result;
-    }
-#endif
-
+    // Initialize all shrink wrapping data.
     void initShrinkWrappingInfo() {
       UsedCSRegs.clear();
       CSRUsed.clear();
@@ -517,8 +488,8 @@ bool PEI::calculateUsedAnticAvail(MachineFunction &Fn) {
   return true;
 }
 
-/// moveSpillsOutOfLoops - helper for placeSpillsAndRestores() which relocates
-///  a spill from a subgraph in a loop to the loop preheader.
+/// moveSpillsOutOfLoops - helper for placeSpillsAndRestores() which
+/// relocates a spill from a subgraph in a loop to the loop preheader.
 /// Returns the MBB to which saves have been moved, or the given MBB
 /// if it is a branch point.
 ///
@@ -654,10 +625,6 @@ void PEI::addSavesForRJoinBlocks(MachineFunction& Fn,
   if (SBLKS.empty())
     return;
 
-#if 0
-  MachineLoopInfo &LI = getAnalysis<MachineLoopInfo>();
-#endif
-
   for (unsigned i = 0, e = SBLKS.size(); i != e; ++i) {
     MachineBasicBlock* MBB = SBLKS[i];
     if (MBB->pred_size() > 1) {
@@ -679,11 +646,6 @@ void PEI::addSavesForRJoinBlocks(MachineFunction& Fn,
             break;
           }
         }
-#if 0
-        if (!CSRUsed[PRED].intersects(CSRRestore[MBB]) &&
-            (PRED->succ_size() == 1 || !LI.getLoopFor(PRED)))
-          needsSave = true;
-#endif
         if (needsSave) {
           // Add saves to PRED for all CSRs restored in MBB...
 #ifndef NDEBUG
