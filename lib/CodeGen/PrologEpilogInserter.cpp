@@ -348,9 +348,14 @@ bool PEI::calculateUsedAnticAvail(MachineFunction &Fn) {
     return false;
   }
 
+<<<<<<< HEAD:lib/CodeGen/PrologEpilogInserter.cpp
 #ifndef NDEBUG
   DOUT << "-----------------------------------------------------------\n";
 #endif
+=======
+  MachineDominatorTree &DT = getAnalysis<MachineDominatorTree>();
+  const TargetRegisterInfo *RegInfo = Fn.getTarget().getRegisterInfo();
+>>>>>>> Shrink Wrapping: DF comp. #2:lib/CodeGen/PrologEpilogInserter.cpp
 
   const TargetRegisterInfo *TRI = Fn.getTarget().getRegisterInfo();
   bool allCSRUsesInEntryBlock = true;
@@ -485,6 +490,7 @@ bool PEI::calculateUsedAnticAvail(MachineFunction &Fn) {
 #endif
   }
 
+<<<<<<< HEAD:lib/CodeGen/PrologEpilogInserter.cpp
   return true;
 }
 
@@ -657,6 +663,33 @@ void PEI::addSavesForRJoinBlocks(MachineFunction& Fn,
         }
       }
     }
+=======
+  // Debugging stuff
+  llvm::cerr << "PEI::buildsets: top-down walk of Machine Dominator Tree:\n";
+
+  // Top-down walk of the dominator tree
+  for (df_iterator<MachineDomTreeNode*> DI = df_begin(DT.getRootNode()),
+         E = df_end(DT.getRootNode()); DI != E; ++DI) {
+    
+    MachineBasicBlock* MBB = DI->getBlock();
+
+    llvm::cerr << "MBB: " << MBB->getBasicBlock()->getName()
+               << " has " << MBB->size() << " instructions\n";
+
+#if 0  
+    // Get the sets to update for this block
+    CSRegSet& currAvail = AvailOut[DI->getBlock()];
+    
+    // A block inherits AVAIL_OUT from its dominator
+    if (DI->getIDom() != 0)
+      currAvail = AvailOut[DI->getIDom()->getBlock()];
+
+    for (MachineBasicBlock::iterator MBI = MBB->begin(), MBE = MBB->end();
+         MBI != MBE; ++MBI) {
+      // buildsets_availout(MBI, currAvail);
+    }
+#endif
+>>>>>>> Shrink Wrapping: DF comp. #2:lib/CodeGen/PrologEpilogInserter.cpp
   }
 }
 
