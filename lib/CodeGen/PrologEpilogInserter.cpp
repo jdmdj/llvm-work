@@ -199,17 +199,8 @@ namespace {
 
     bool calculateSets(MachineFunction &Fn);
     void calculateAnticAvail(MachineFunction &Fn);
-    bool moveSpillsOutOfLoops(MachineFunction &Fn,
-                              MachineBasicBlock* MBB,
-                              std::vector<MachineBasicBlock*>& RBLKS);
-    void addRestoresForSBranchBlocks(MachineFunction &Fn,
-                                     std::vector<MachineBasicBlock*>& RBLKS);
-
-    bool moveRestoresOutOfLoops(MachineFunction& Fn,
-                                MachineBasicBlock* MBB,
-                                std::vector<MachineBasicBlock*>& SBLKS);
-    void addSavesForRJoinBlocks(MachineFunction& Fn,
-                                std::vector<MachineBasicBlock*>& SBLKS);
+    void addRestoresForBranchBlock(MachineBasicBlock* MBB);
+    void addSpillsForJoinBlock(MachineBasicBlock* MBB);
     void placeSpillsAndRestores(MachineFunction &Fn);
     void placeCSRSpillsAndRestores(MachineFunction &Fn);
     void calculateCalleeSavedRegisters(MachineFunction &Fn);
@@ -460,8 +451,10 @@ void PEI::calculateAnticAvail(MachineFunction &Fn) {
   }
 
   // EXP
+#if 0
   AnticIn[EntryBlock].clear();
   AnticOut[EntryBlock].clear();
+#endif
 
 #ifndef NDEBUG
   DOUT << "-----------------------------------------------------------\n";
@@ -486,7 +479,7 @@ void PEI::propagateUsesAroundLoop(MachineBasicBlock* MBB, MachineLoop* LP) {
     if (LBB == MBB)
       continue;
     CSRUsed[LBB] |= CSRUsed[MBB];
-#ifndef NDEBUG
+#if 0
     DOUT << "Propagating uses "
          << stringifyCSRegSet(CSRUsed[MBB])
          << " from " << getBasicBlockName(MBB)
@@ -632,19 +625,23 @@ bool PEI::calculateSets(MachineFunction &Fn) {
             // if a CSR is used in the entry block, add it directly
             // to CSRSave[EntryBlock] and to CSRRestore[R] for R
             // in ReturnBlocks. Note CSR uses in non-entry blocks.
+            if (MBB != EntryBlock)
+              allCSRUsesInEntryBlock = false;
+#if 0
             if (! ShrinkWrapThisFunction || MBB == EntryBlock) {
               CSRSave[MBB].set(inx);
               for (unsigned ri = 0, re = ReturnBlocks.size(); ri != re; ++ri)
                 CSRRestore[ReturnBlocks[ri]].set(inx);
             } else if (MBB != EntryBlock)
               allCSRUsesInEntryBlock = false;
+#endif
           }
         }
       }
     }
     if (! ShrinkWrapThisFunction || CSRUsed[MBB].empty())
       continue;
-    // EXP -- propagate CSRUsed[MBB] in loops
+    // Propagate CSRUsed[MBB] in loops
     if (MachineLoop* LP = LI.getLoopFor(MBB)) {
 
       // Add top level loop to work list.
@@ -706,231 +703,140 @@ bool PEI::calculateSets(MachineFunction &Fn) {
   return true;
 }
 
-/// moveSpillsOutOfLoops - helper for placeSpillsAndRestores() which
-/// relocates a spill from a subgraph in a loop to the loop preheader.
-/// Returns the MBB to which saves have been moved, or the given MBB
-/// if it is a branch point.
+/// TODO -- here:
+///   rewrite these two functions to search (up)down in the MCFG from a
+///   (pred) successor stopping on the first occurrance of:
+///   a) a restore of CSRSave[MBB]
+///   b) a spill of CSRSave[MBB]
 ///
-bool PEI::moveSpillsOutOfLoops(MachineFunction &Fn,
-                               MachineBasicBlock* MBB,
-                               std::vector<MachineBasicBlock*>& RBLKS) {
-  if (MBB == 0 || CSRSave[MBB].empty())
-    return false;
-
-  MachineLoopInfo &LI = getAnalysis<MachineLoopInfo>();
-  bool movedAny = false;
-
-  if (MachineLoop* LP = LI.getLoopFor(MBB)) {
-    MachineBasicBlock* LPH = getTopLevelLoopPreheader(LP);
-    std::vector<MachineBasicBlock*> tmpBlks;
-    // EXP -- don't move saves to LPH if AvailIn[LPH] contains CSRSave[MBB]
-    bool availInDest = true;
-
-    if (LPH) {
-      // EXP -- don't move saves to LPH if AvailIn[LPH] contains CSRSave[MBB]
-      for (CSRegSet::iterator RI = CSRSave[MBB].begin(),
-             RE = CSRSave[MBB].end(); RI != RE; ++RI) {
-        if (! AvailIn[LPH].test(*RI)) {
-          availInDest = false;
-          break;
-        }
-      }
-      if (! availInDest)
-        tmpBlks.push_back(LPH);
-    } else {
-      MachineLoop* PLP = getTopLevelLoopParent(LP);
-      assert(PLP && "Loop with no top level parent!");
-      MachineBasicBlock* HDR = PLP->getHeader();
-      for (MachineBasicBlock::pred_iterator PI = HDR->pred_begin(),
-             PE = HDR->pred_end(); PI != PE; ++PI) {
-        MachineBasicBlock* PRED = *PI;
-        if (LI.getLoopFor(PRED))
-          continue;
-        for (CSRegSet::iterator RI = CSRSave[MBB].begin(),
-               RE = CSRSave[MBB].end(); RI != RE; ++RI) {
-          if (! AvailIn[LPH].test(*RI)) {
-            availInDest = false;
-            break;
-          }
-        }
-        if (! availInDest)
-          tmpBlks.push_back(PRED);
-      }
-    }
-    movedAny = true;
-
-#ifndef NDEBUG
-    DOUT << "Moving saves of "
-         << stringifyCSRegSet(CSRSave[MBB])
-         << " from " << getBasicBlockName(MBB)
-         << " to";
-    for (unsigned i = 0, e = tmpBlks.size(); i != e; ++i)
-      DOUT << " " << getBasicBlockName(tmpBlks[i]);
-    DOUT << "\n";
-#endif
-
-    for (unsigned i = 0, e = tmpBlks.size(); i != e; ++i) {
-      LPH = tmpBlks[i];
-      // Add CSRegSet from MBB to LPH, empty out MBB's CSRegSet.
-      CSRSave[LPH] |= CSRSave[MBB];
-      // If saves moved to entry block, add restores to returns.
-      if (LPH == EntryBlock) {
-        for (unsigned ir = 0, er = ReturnBlocks.size(); ir != er; ++ir)
-          CSRRestore[ReturnBlocks[ir]] |= CSRSave[MBB];
-      } else {
-        // Remember where we moved the save so we can add
-        // restores on successor paths if necessary.
-        if (LPH->succ_size() > 1)
-          RBLKS.push_back(LPH);
-      }
-    }
-    // Clear save bits in MBB.
-    CSRSave[MBB].clear();
-  } else if (MBB->succ_size() > 1)
-    RBLKS.push_back(MBB);
-  return movedAny;
-}
-
-/// addRestoresForSBranchBlock - helper for placeSpillsAndRestores() which
+///  If the search hits the end without seeing a) or b), insert spill/restore
+///  in pred/successor. If a), ...
+///
+/// addRestoresForBranchBlock - helper for placeSpillsAndRestores() which
 /// adds restores of CSRs saved in branch point MBBs to the front of any
 /// successor blocks connected to regions with no uses of the saved CSRs.
 ///
-void PEI::addRestoresForSBranchBlocks(MachineFunction &Fn,
-                                      std::vector<MachineBasicBlock*>& RBLKS) {
+void PEI::addRestoresForBranchBlock(MachineBasicBlock* MBB) {
 
-  if (RBLKS.empty())
+  if (! MBB || MBB->succ_size() < 2 || CSRSave[MBB].empty() |
+      CSRSave[MBB] == CSRRestore[MBB])
     return;
 
-  // Add restores of CSRs saved in branch point MBBs to the
-  // front of any succ blocks flowing into regions that
-  // have no uses of MBB's CSRs.
-  for (unsigned i = 0, e = RBLKS.size(); i != e; ++i) {
-    MachineBasicBlock* MBB = RBLKS[i];
-    bool hasCSRUses = false;
-    for (MachineBasicBlock::succ_iterator SI = MBB->succ_begin(),
-           SE = MBB->succ_end(); SI != SE; ++SI) {
-      MachineBasicBlock* SUCC = *SI;
-      bool needsRestore = false;
-      if (CSRUsed[SUCC].intersects(CSRSave[MBB])) {
-        hasCSRUses = true;
-        continue;
-      }
-      needsRestore = true;
-      for (df_iterator<MachineBasicBlock*> BI = df_begin(SUCC),
-             BE = df_end(SUCC); BI != BE; ++BI) {
-        MachineBasicBlock* SBB = *BI;
-        if (CSRUsed[SBB].intersects(CSRSave[MBB])) {
-          hasCSRUses = true;
-          needsRestore = false;
-          break;
-        }
-      }
-      // Additional restores are needed for SUCC iff there is at least
-      // one CSR use reachable from the successors of MBB and there
-      // are no uses in or below SUCC.
-      if (needsRestore && hasCSRUses) {
+  // Check all MBBs reachable from the imm. successors of MBB...
+  for (MachineBasicBlock::succ_iterator SI = MBB->succ_begin(),
+         SE = MBB->succ_end(); SI != SE; ++SI) {
+    MachineBasicBlock* SUCC = *SI;
+
+    bool needsRestore = false;
+    // If all regs spilled in MBB are restored in SUCC,
+    // this successor needs no further processing.
+    CSRegSet tmp = CSRSave[MBB] & CSRRestore[SUCC];
+    if (tmp == CSRSave[MBB])
+      continue;
+    // If all regs spilled in MBB are also spilled in SUCC,
+    // remove the spills from SUCC.
+    // TODO -- should be an assertion
+    tmp = CSRSave[MBB] & CSRSave[SUCC];
+    if (tmp == CSRSave[MBB]) {
 #ifndef NDEBUG
-        DOUT << "MBB " << getBasicBlockName(MBB)
-             << " needs a restore on path to successor "
-             << getBasicBlockName(SUCC) << "\n";
+      DOUT << "Removing spills for " << stringifyCSRegSet(CSRSave[SUCC])
+           << " from " << getBasicBlockName(SUCC)
+           << " spilled in predecessor " << getBasicBlockName(MBB) << "\n";
 #endif
-        // Add restores to SUCC for all CSRs saved in MBB...
-        CSRRestore[SUCC] = CSRSave[MBB];
+      CSRSave[SUCC] = CSRSave[SUCC] - CSRSave[MBB];
+    }
+    // Check if SUCC should have restores for regs in CSRSave[MBB].
+    needsRestore = true;
+    for (df_iterator<MachineBasicBlock*> BI = df_begin(SUCC),
+           BE = df_end(SUCC); BI != BE; ++BI) {
+      MachineBasicBlock* SBB = *BI;
+      // If we see spills for CSRSave[MBB] at this point, we have
+      // no restores on this path from MBB, so restores are required in SUCC.
+      tmp = CSRSave[MBB] & CSRSave[SBB];
+      if (tmp == CSRSave[MBB])
+        break;
+      // If we see restores for CSRSave[MBB], SUCC needs no restores.
+      tmp = CSRSave[MBB] & CSRRestore[SBB];
+      if (tmp == CSRSave[MBB]) {
+        needsRestore = false;
+        break;
       }
+    }
+    // Additional restores are needed for SUCC iff there is at least
+    // one CSR use reachable from the successors of MBB and there
+    // are no uses in or below SUCC.
+    if (needsRestore) {
+#ifndef NDEBUG
+      DOUT << "Adding restores for " << stringifyCSRegSet(CSRSave[MBB])
+           << " to "   << getBasicBlockName(SUCC)
+           << " from " << getBasicBlockName(MBB) << "\n";
+#endif
+      // Add restores to SUCC for all CSRs saved in MBB...
+      CSRRestore[SUCC] |= CSRSave[MBB];
     }
   }
 }
 
-/// moveRestoresOutOfLoops - helper for placeSpillsAndRestores() which
-/// relocates restores from a subgraph in a loop to the loop exit blocks.
-/// This function records the MBBs to which restores have been moved in
-/// SBLKS. If no restores are moved, SBLKS contains the input MBB if it
-/// is a join point in the Machine CFG.
-///
-bool PEI::moveRestoresOutOfLoops(MachineFunction& Fn,
-                                 MachineBasicBlock* MBB,
-                                 std::vector<MachineBasicBlock*>& SBLKS) {
-
-  SBLKS.clear();
-  if (MBB == 0 || CSRRestore[MBB].empty())
-    return false;
-
-  MachineLoopInfo &LI = getAnalysis<MachineLoopInfo>();
-  bool movedAny = false;
-
-  if (MachineLoop* LP = LI.getLoopFor(MBB)) {
-    LP = getTopLevelLoopParent(LP);
-    assert(LP && "Loop with no top level parent?");
-
-    SmallVector<MachineBasicBlock*, 4> exitBlocks;
-
-    LP->getExitBlocks(exitBlocks);
-    assert(exitBlocks.size() > 0 &&
-           "Loop has no top level exit blocks?");
-
-    movedAny = true;
-    for (unsigned i = 0, e = exitBlocks.size(); i != e; ++i) {
-      MachineBasicBlock* EXB = exitBlocks[i];
-
-#ifndef NDEBUG
-      DOUT << "Moving restores of "
-           << stringifyCSRegSet(CSRRestore[MBB])
-           << " from " << getBasicBlockName(MBB)
-           << " to " << getBasicBlockName(EXB) << "\n";
-#endif
-
-      // Add CSRegSet from MBB to LPE, empty out MBB's CSRegSet.
-      CSRRestore[EXB] |= CSRRestore[MBB];
-      if (EXB->pred_size() > 1)
-        SBLKS.push_back(EXB);
-    }
-    CSRRestore[MBB].clear();
-  } else if (MBB->pred_size() > 1)
-    SBLKS.push_back(MBB);
-  return movedAny;
-}
-
-/// addSavesForRJoinBlocks - Add saves of CSRs restored in join point MBBs
+/// addSpillsForJoinBlock - Add saves of CSRs restored in join point MBBs
 /// to the ends of any pred blocks that flow into MBB from regions that
 /// have no uses of MBB's CSRs.
 ///
-void PEI::addSavesForRJoinBlocks(MachineFunction& Fn,
-                                 std::vector<MachineBasicBlock*>& SBLKS) {
+void PEI::addSpillsForJoinBlock(MachineBasicBlock* MBB) {
 
-  if (SBLKS.empty())
+  if (! MBB || MBB->pred_size() < 2 || CSRRestore[MBB].empty())
     return;
 
-  for (unsigned i = 0, e = SBLKS.size(); i != e; ++i) {
-    MachineBasicBlock* MBB = SBLKS[i];
-    if (MBB->pred_size() > 1) {
-      bool needsSave = false;
-      for (MachineBasicBlock::pred_iterator PI = MBB->pred_begin(),
-             PE = MBB->pred_end(); PI != PE; ++PI) {
-        MachineBasicBlock* PRED = *PI;
 
-        // Walk back up in the CFG from the preds of MBB, look for
-        // a block that uses any CSR that is restored in MBB.
-        if (CSRUsed[PRED].intersects(CSRRestore[MBB]))
-          continue;
-        needsSave = true;
-        for (idf_iterator<MachineBasicBlock*> PPI = idf_begin(PRED),
-               PPE = idf_end(PRED); PPI != PPE; ++PPI) {
-          MachineBasicBlock* PBB = *PPI;
-          if (CSRUsed[PBB].intersects(CSRRestore[MBB])) {
-            needsSave = false;
-            break;
-          }
-        }
-        if (needsSave) {
-          // Add saves to PRED for all CSRs restored in MBB...
+  bool needsSpill = false;
+  for (MachineBasicBlock::pred_iterator PI = MBB->pred_begin(),
+         PE = MBB->pred_end(); PI != PE; ++PI) {
+    MachineBasicBlock* PRED = *PI;
+
+    // If all regs restored in MBB are spilled in PRED,
+    // PRED needs no further processing.
+    CSRegSet tmp = CSRRestore[MBB] & CSRSave[PRED];
+    if (tmp == CSRRestore[MBB])
+      continue;
+    // If all regs restored in MBB are also restored in PRED,
+    // remove the restores from PRED.
+    // TODO -- should be an assertion
+    tmp = CSRRestore[MBB] & CSRRestore[PRED];
+    if (tmp == CSRRestore[MBB]) {
 #ifndef NDEBUG
-          DOUT << "MBB " << getBasicBlockName(MBB)
-               << " needs a save on path from predecessor "
-               << getBasicBlockName(PRED) << "\n";
+      DOUT << "Removing restores for " << stringifyCSRegSet(CSRRestore[PRED])
+           << " from " << getBasicBlockName(PRED)
+           << " restored in successor " << getBasicBlockName(MBB) << "\n";
 #endif
-          CSRSave[PRED] = CSRRestore[MBB];
-        }
+      CSRRestore[PRED] = CSRRestore[PRED] - CSRRestore[MBB];
+    }
+
+    // Walk back up in the CFG from the preds of MBB, look for
+    // a block that uses any CSR that is restored in MBB.
+    needsSpill = true;
+    for (idf_iterator<MachineBasicBlock*> PPI = idf_begin(PRED),
+           PPE = idf_end(PRED); PPI != PPE; ++PPI) {
+      MachineBasicBlock* PBB = *PPI;
+
+      // If we see restores for CSRRestore[MBB] at this point, we have
+      // no restores on this path to MBB, so spills are required in PRED.
+      tmp = CSRRestore[MBB] & CSRRestore[PBB];
+      if (tmp == CSRRestore[MBB])
+        break;
+      // If we see spills for CSRRestore[MBB], PRED needs no spills.
+      tmp = CSRRestore[MBB] & CSRSave[PBB];
+      if (tmp == CSRRestore[MBB]) {
+        needsSpill = false;
+        break;
       }
+    }
+    if (needsSpill) {
+      // Add saves to PRED for all CSRs restored in MBB...
+#ifndef NDEBUG
+      DOUT << "Adding spills for " << stringifyCSRegSet(CSRRestore[MBB])
+           << " to "   << getBasicBlockName(PRED)
+           << " from " << getBasicBlockName(MBB) << "\n";
+#endif
+      CSRSave[PRED] |= CSRRestore[MBB];
     }
   }
 }
@@ -945,13 +851,16 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
   DOUT << "-----------------------------------------------------------\n";
 #endif
 
+  std::vector<MachineBasicBlock*> SBranchBlocks, RJoinBlocks;
   // Calculate CSR{Save,Restore} using Antic, Avail on the Machine-CFG.
   for (MachineFunction::iterator MBBI = Fn.begin(), MBBE = Fn.end();
        MBBI != MBBE; ++MBBI) {
     MachineBasicBlock* MBB = MBBI;
+#if 0
     // Entry block saves are recorded in UsedCSRegs pass above.
     if (MBB == EntryBlock)
       continue;
+#endif
     // Intersect (CSRegs - AnticIn[P]) for all predecessors P of MBB
     CSRegSet anticInPreds;
     MachineBasicBlock::pred_iterator PI = MBB->pred_begin(),
@@ -973,24 +882,26 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
             anticInPreds = (UsedCSRegs - AnticIn[PRED]);
         }
       }
+    } else {
+      // Take care of uses in entry blocks (which have no predecessors).
+      // This is necessary because the DFA formulation assumes the
+      // entry and (multiple) exit nodes cannot have CSR uses, which
+      // is not the case in the real world.
+      anticInPreds = UsedCSRegs;
     }
+
     // Compute spills required at MBB:
     CSRSave[MBB] |= (AnticIn[MBB] - AvailIn[MBB]) & anticInPreds;
 
-    if (! CSRSave[MBB].empty()) {
+    if (MBB != EntryBlock && ! CSRSave[MBB].empty()) {
       if (CSRSave[EntryBlock].intersects(AvailIn[MBB])) {
         CSRSave[MBB] = CSRSave[MBB] - CSRSave[EntryBlock];
       }
+      // Remember this block for adding restores to successor
+      // blocks for multi-entry region.
+      if (! CSRSave[MBB].empty() && MBB->succ_size() > 1)
+        SBranchBlocks.push_back(MBB);
     }
-
-#if 0
-    // Move saves inside loops to the preheaders of the outermost
-    // containing loops, add restores to blocks reached by saves
-    // placed at branch points where necessary.
-    std::vector<MachineBasicBlock*> restoreBlocks;
-    moveSpillsOutOfLoops(Fn, MBB, restoreBlocks);
-    addRestoresForSBranchBlocks(Fn, restoreBlocks);
-#endif
 
 #ifndef NDEBUG
     if (! CSRSave[MBB].empty())
@@ -1022,6 +933,9 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
     } else {
       if (! CSRUsed[MBB].empty() || ! AvailOut[MBB].empty()) {
         // Take care of uses in return blocks (which have no successors).
+        // This is necessary because the DFA formulation assumes the
+        // entry and (multiple) exit nodes cannot have CSR uses, which
+        // is not the case in the real world.
         availOutSucc = UsedCSRegs;
       }
     }
@@ -1058,19 +972,11 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
           }
         }
       }
+      // Remember this block for adding saves to predecessor
+      // blocks for multi-entry region.
+      if (! CSRRestore[MBB].empty() && MBB->pred_size() > 1)
+        RJoinBlocks.push_back(MBB);
     }
-
-#if 0
-    // Move restores inside loops to the exits of the outermost (top level)
-    // containing loops.
-    std::vector<MachineBasicBlock*> saveBlocks;
-    moveRestoresOutOfLoops(Fn, MBB, saveBlocks);
-
-    // Add saves of CSRs restored in join point MBBs to the ends
-    // of any pred blocks that flow into MBB from regions that
-    // have no uses of MBB's CSRs.
-    addSavesForRJoinBlocks(Fn, saveBlocks);
-#endif
 
 #ifndef NDEBUG
     if (! CSRRestore[MBB].empty())
@@ -1099,8 +1005,19 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
              << " to " << getBasicBlockName(EXB) << "\n";
 #endif
         CSRRestore[EXB] |= CSRSave[MBB];
+        if (EXB->pred_size() > 1)
+          RJoinBlocks.push_back(EXB);
       }
     }
+  }
+  // EXP -- fix problems related to branch, join points.
+  for (unsigned i = 0, e = SBranchBlocks.size(); i != e; ++i) {
+    MachineBasicBlock* MBB = SBranchBlocks[i];
+    addRestoresForBranchBlock(MBB);
+  }
+  for (unsigned i = 0, e = RJoinBlocks.size(); i != e; ++i) {
+    MachineBasicBlock* MBB = RJoinBlocks[i];
+    addSpillsForJoinBlock(MBB);
   }
 
 #ifndef NDEBUG
