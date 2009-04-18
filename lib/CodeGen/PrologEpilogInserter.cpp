@@ -196,8 +196,10 @@ namespace {
 
     // Map of MBBs to top level MachineLoops.
     DenseMap<MachineBasicBlock*, MachineLoop*> TLLoops;
+#if 0
     // Map of TLLoop exit blocks -> exit targets.
     DenseMap<MachineBasicBlock*, MachineBasicBlock*> TLLoopExits;
+#endif
 
     // Flag to control shrink wrapping per-function:
     // may choose to skip shrink wrapping for certain
@@ -240,7 +242,9 @@ namespace {
       UsedCSRegs.clear();
       CSRUsed.clear();
       TLLoops.clear();
+#if 0
       TLLoopExits.clear();
+#endif
       initDFASets();
       ShrinkWrapThisFunction = (ShrinkWrapping || ShrinkWrapLiberally);
     }
@@ -1124,7 +1128,6 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
       MachineBasicBlock* HDR = LP->getHeader();
       SmallVector<MachineBasicBlock*, 4> exitBlocks;
       CSRegSet loopSpills;
-      bool placedRestores = false;
 
       loopSpills = CSRSave[MBB];
       if (CSRSave[MBB].empty()) {
@@ -1133,6 +1136,7 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
       } else if (CSRRestore[MBB].contains(CSRSave[MBB]))
         continue;
 
+#if 0
       // Try placing restores directly in exiting blocks of LP
       // to simulate splitting the edge connecting the loop
       // exiting node/latch to the loop exit node.
@@ -1140,6 +1144,14 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
       // Unfortunately, we can't do this because it breaks
       // the MCFG: we end up with instructions _following_ the
       // terminator instruction in the exiting block.
+      //
+      // So it appears that the only way to shrink wrap
+      // partial top level loops is to split the exit edges.
+      //
+      // Edge splitting in the MCFG is not really supported by
+      // the framework, so this will require some study and
+      // extentsions: see branch folding.
+      bool placedRestores = false;
       LP->getExitingBlocks(exitBlocks);
       assert(exitBlocks.size() > 0 && "Loop has no top level exiting blocks?");
       for (unsigned i = 0, e = exitBlocks.size(); i != e; ++i) {
@@ -1194,6 +1206,7 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
       }
       if (placedRestores)
         continue;
+#endif
 
       LP->getExitBlocks(exitBlocks);
       assert(exitBlocks.size() > 0 && "Loop has no top level exit blocks?");
@@ -1520,23 +1533,54 @@ void PEI::insertCSRSpillsAndRestores(MachineFunction &Fn) {
              "Could not find callee saved register info");
 
       // If MBB is empty and needs restores, insert at the _beginning_.
-      // Simulate edge-splitting for loop exits:
-      //   if MBB is loop exit (look up MBB in loop exiting blocks map)
-      //     if MBB branches out
-      //       inst = find cti that branches out
-      //       insert restores immediately before inst
-      //     else
-      //       insert restores at end of MBB.
       if (MBB->empty()) {
         I = MBB->begin();
       } else {
         I = MBB->end();
         --I;
 
-        // TODO -- here: Try to simulate edge splitting for loop exits.
-        //  ...
-        //  Unfortunately this breaks the (machine) basic block abstraction
-        //  by inserting code _after_ the terminator instruction.
+        // Skip over all terminator instructions, which are part of the
+        // return sequence.
+        if (! I->getDesc().isTerminator()) {
+          ++I;
+        } else {
+          MachineBasicBlock::iterator I2 = I;
+          while (I2 != MBB->begin() && (--I2)->getDesc().isTerminator())
+            I = I2;
+        }
+#if 0
+        // Simulate edge splitting for certain loop exits.
+        // Unfortunately this appears to break the MCFG by inserting
+        // code _after_ the terminator instruction.
+        // Here is an example of the generated (X86) assembly for the
+        // fall-through case:
+        //
+        // LBB10_20:	## bb1243
+        // 	movl	(%esp), %ecx
+        // 	movl	44(%esp), %eax
+        // 	cmpl	(%ecx), %eax
+        // 	jne	LBB10_-1	## bb418
+        // 	movl	52(%esp), %ebp
+        // 	movl	56(%esp), %ebx
+        // 	movl	60(%esp), %edi
+        // 	movl	64(%esp), %esi
+        // LBB10_21:	## return
+        // 	addl	$68, %esp
+        // 	ret
+        //
+        // LBB10_20 is the loop exiting block, terminated by the jne
+        // which branches into the loop or allows fall-through to
+        // LBB10_21, the (single) return block. The restores have been
+        // inserted at the end of LBB10_20 so that they will be executed
+        // in the fall-through case, simulating splitting the fall-through
+        // edge from LBB10_20->LBB10_21. For some reason, this causes the
+        // target MBB bb418 (and the subgraph it dominates) to removed.
+        // The jne target label comes out as "LBB10_-1", although the target
+        // MBB name is still known and appears in the comment on the jnr.
+        // (Example from test-suite stepanov_container).
+        //
+        // See comments in placeSpillsAndRestores().
+
         MachineBasicBlock* EXT = TLLoopExits[MBB];
         if (EXT) {
           MachineBasicBlock::iterator I2 = MBB->end();
@@ -1569,6 +1613,7 @@ void PEI::insertCSRSpillsAndRestores(MachineFunction &Fn) {
               I = I2;
           }
         }
+#endif
       }
 
       bool AtStart = I == MBB->begin();
