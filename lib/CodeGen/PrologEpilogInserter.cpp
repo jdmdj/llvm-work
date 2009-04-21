@@ -68,7 +68,13 @@ using namespace llvm;
 // Shrink Wrapping:
 static cl::opt<bool>
 ShrinkWrapping("shrink-wrap",
-  cl::desc("Apply shrink wrapping to callee-saved register spills/restores"));
+               cl::desc("Shrink wrap callee-saved register spills/restores"));
+
+static cl::opt<std::string>
+ShrinkWrapFunc("shrink-wrap-func",
+               cl::desc("Shrink wrap the specified function"),
+               cl::value_desc("funcname"),
+               cl::init(""));
 
 namespace {
   struct VISIBILITY_HIDDEN PEI : public MachineFunctionPass {
@@ -81,7 +87,7 @@ namespace {
 
     virtual void getAnalysisUsage(AnalysisUsage &AU) const {
       AU.setPreservesCFG();
-      if (ShrinkWrapping) {
+      if (ShrinkWrapping || ShrinkWrapFunc != "") {
         AU.addRequired<MachineLoopInfo>();
         AU.addRequired<MachineDominatorTree>();
       }
@@ -98,6 +104,8 @@ namespace {
       RS = TRI->requiresRegisterScavenging(Fn) ? new RegScavenger() : NULL;
 
       MF = &Fn;
+      // DEBUG
+      MFName = MF->getFunction()->getName();
 
       // Get MachineModuleInfo so that we can track the construction of the
       // frame.
@@ -129,7 +137,7 @@ namespace {
       // before the frame layout is finalized.
       TRI->processFunctionBeforeFrameFinalized(Fn);
 
-      // Calculate actual frame offsets for all of the abstract stack objects...
+      // Calculate actual frame offsets for all abstract stack objects...
       calculateFrameObjectOffsets(Fn);
 
       // Add prolog and epilog code to the function.  This function is required
@@ -157,6 +165,9 @@ namespace {
 
     // Machine function handle.
     MachineFunction* MF;
+
+    // DEBUG
+    std::string MFName;
 
     // Analysis info for spill/restore placement.
     // "CSR": "callee saved register".
@@ -201,10 +212,12 @@ namespace {
     bool calcAnticInOut(MachineBasicBlock* MBB);
     bool calcAvailInOut(MachineBasicBlock* MBB);
     void calculateAnticAvail(MachineFunction &Fn);
+#if 0
     bool addCSRUsesForJoin(MachineBasicBlock* MBB,
                            SmallVector<MachineBasicBlock*, 4>& blks);
-    bool addCSRUsesForBranch(MachineBasicBlock* MBB,
-                             SmallVector<MachineBasicBlock*, 4>& blks);
+#endif
+    bool addCSRUsesForCoverBlock(MachineBasicBlock* MBB,
+                                 SmallVector<MachineBasicBlock*, 4>& blks);
     void placeSpillsAndRestores(MachineFunction &Fn);
     void placeCSRSpillsAndRestores(MachineFunction &Fn);
     void calculateCalleeSavedRegisters(MachineFunction &Fn);
@@ -212,10 +225,6 @@ namespace {
     void calculateFrameObjectOffsets(MachineFunction &Fn);
     void replaceFrameIndices(MachineFunction &Fn);
     void insertPrologEpilogCode(MachineFunction &Fn);
-
-    // EXP
-    bool loopPreheaderNeedsSpills(MachineBasicBlock* MBB,
-                                  MachineBasicBlock* HDR);
 
     // Initialize all DFA sets, called before iterations.
     void initDFASets() {
@@ -236,7 +245,21 @@ namespace {
       CSRUsed.clear();
       TLLoops.clear();
       initDFASets();
-      ShrinkWrapThisFunction = ShrinkWrapping;
+      // Enable or disable shrink wrapping for the current function
+      // as requested.
+      ShrinkWrapThisFunction = false;
+      if (ShrinkWrapFunc != "") {
+        if (MFName == ShrinkWrapFunc) {
+          ShrinkWrapThisFunction = true;
+        }
+#ifndef NDEBUG
+        if (! ShrinkWrapThisFunction)
+          DOUT << "DISABLED: " << MFName
+               << ": shrink-wrap-func: not selected\n";
+#endif
+      } else {
+        ShrinkWrapThisFunction = ShrinkWrapping;
+      }
     }
 
     // Convienences for dealing with machine loops.
@@ -432,7 +455,7 @@ void PEI::placeCSRSpillsAndRestores(MachineFunction &Fn) {
 
 #ifndef NDEBUG
   DOUT << "Place CSR spills/restores for "
-       << Fn.getFunction()->getName() << "\n";
+       << MF->getFunction()->getName() << "\n";
 #endif
 
   initShrinkWrappingInfo();
@@ -583,8 +606,8 @@ bool PEI::calculateSets(MachineFunction &Fn) {
   // If no CSRs used, we are done.
   if (CSI.empty()) {
 #ifndef NDEBUG
-    DOUT << Fn.getFunction()->getName()
-         << " uses no callee-saved registers.\n";
+    DOUT << "DISABLED: " << Fn.getFunction()->getName()
+         << ": uses no callee-saved registers\n";
 #endif
     return false;
   }
@@ -650,7 +673,7 @@ bool PEI::calculateSets(MachineFunction &Fn) {
           if (MOReg == Reg ||
               (TargetRegisterInfo::isPhysicalRegister(MOReg) &&
                TargetRegisterInfo::isPhysicalRegister(Reg) &&
-               TRI->isSubRegister(MOReg, Reg))) {
+               TRI->isSubRegister(Reg, MOReg))) {
             // CSR Reg is defined/used in block MBB.
             UsedCSRegs.set(inx);
             CSRUsed[MBB].set(inx);
@@ -786,13 +809,13 @@ bool PEI::calculateSets(MachineFunction &Fn) {
   return true;
 }
 
-/// addCSRUsesForBranch - helper for placeSpillsAndRestores() which
+/// addCSRUsesForCoverBlock - helper for placeSpillsAndRestores() which
 /// adds uses of CSRs saved in branch point MBBs to any successor blocks
 //  connected to regions with no uses of the saved CSRs.
 ///
-bool PEI::addCSRUsesForBranch(MachineBasicBlock* MBB,
-                              SmallVector<MachineBasicBlock*, 4>& blks) {
-  if (! MBB || MBB->succ_size() < 2)
+bool PEI::addCSRUsesForCoverBlock(MachineBasicBlock* MBB,
+                                  SmallVector<MachineBasicBlock*, 4>& blks) {
+  if (! MBB || (MBB->succ_size() < 2 && MBB->pred_size() < 2))
     return false;
 
   bool addedUses = false;
@@ -811,7 +834,7 @@ bool PEI::addCSRUsesForBranch(MachineBasicBlock* MBB,
     blks.push_back(SUCC);
 #ifndef NDEBUG
       DOUT << "Adding uses for " << stringifyCSRegSet(CSRUsed[MBB])
-           << " to successor"    << getBasicBlockName(SUCC)
+           << " to successor "   << getBasicBlockName(SUCC)
            << " from branch "    << getBasicBlockName(MBB) << "\n";
 #endif
   }
@@ -835,6 +858,7 @@ bool PEI::addCSRUsesForBranch(MachineBasicBlock* MBB,
   return addedUses;
 }
 
+#if 0
 /// addCSRUsesForJoin - Add saves of CSRs restored in join point MBBs
 /// to the ends of any pred blocks that flow into MBB from regions that
 /// have no uses of MBB's CSRs.
@@ -883,6 +907,7 @@ bool PEI::addCSRUsesForJoin(MachineBasicBlock* MBB,
   }
   return addedUses;
 }
+#endif
 
 /// placeSpillsAndRestores - decide which MBBs need spills, restores
 /// of CSRs.
@@ -893,7 +918,10 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
   DOUT << "-----------------------------------------------------------\n";
 #endif
 
+#if 0
   SmallVector<MachineBasicBlock*, 4> branchBlocks, joinBlocks;
+#endif
+  SmallVector<MachineBasicBlock*, 4> coverBlocks;
   bool changed = true;
   unsigned iterations = 0;
   while (changed) {
@@ -936,11 +964,11 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
           if (CSRSave[EntryBlock].intersects(CSRSave[MBB])) {
             CSRSave[MBB] = CSRSave[MBB] - CSRSave[EntryBlock];
           }
-          // Remember this block for adding restores to successor
-          // blocks for multi-entry region.
-          if (! CSRSave[MBB].empty() && MBB->succ_size() > 1)
-            branchBlocks.push_back(MBB);
         }
+        // Remember this block for adding restores to successor
+        // blocks for multi-entry region.
+        if (! CSRSave[MBB].empty() && MBB->succ_size() > 1)
+          coverBlocks.push_back(MBB);
       }
 
 #ifndef NDEBUG
@@ -980,11 +1008,11 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
       if (MBB->succ_size() && ! CSRRestore[MBB].empty()) {
         if (! CSRSave[EntryBlock].empty())
           CSRRestore[MBB] = CSRRestore[MBB] - CSRSave[EntryBlock];
-        // Remember this block for adding saves to predecessor
-        // blocks for multi-entry region.
-        if (MBB->pred_size() > 1)
-          joinBlocks.push_back(MBB);
       }
+      // Remember this block for adding saves to predecessor
+      // blocks for multi-entry region.
+      if (! CSRRestore[MBB].empty() && MBB->pred_size() > 1)
+        coverBlocks.push_back(MBB);
 #ifndef NDEBUG
       if (! CSRRestore[MBB].empty())
         DOUT << "RESTORE[" << getBasicBlockName(MBB) << "] = "
@@ -1026,23 +1054,23 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
                << " for loop " << getBasicBlockName(MBB)
                << " to " << getBasicBlockName(EXB) << "\n";
 #endif
-          if (EXB->pred_size() > 1)
-            joinBlocks.push_back(EXB);
+          if (EXB->succ_size() > 1 || EXB->pred_size() > 1)
+            coverBlocks.push_back(EXB);
         }
       }
     }
 
     // Add uses for spills, restores related to branch, join points.
     SmallVector<MachineBasicBlock*, 4> tmpBlocks;
-    while (! branchBlocks.empty()) {
-      MachineBasicBlock* MBB = branchBlocks.pop_back_val();
-      changed |= addCSRUsesForBranch(MBB, tmpBlocks);
+    while (! coverBlocks.empty()) {
+      MachineBasicBlock* MBB = coverBlocks.pop_back_val();
+      changed |= addCSRUsesForCoverBlock(MBB, tmpBlocks);
     }
     if (! tmpBlocks.empty()) {
-      branchBlocks = tmpBlocks;
+      coverBlocks = tmpBlocks;
       tmpBlocks.clear();
     }
-
+#if 0
     while (! joinBlocks.empty()) {
       MachineBasicBlock* MBB = joinBlocks.pop_back_val();
       changed |= addCSRUsesForJoin(MBB, tmpBlocks);
@@ -1051,6 +1079,7 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
       joinBlocks = tmpBlocks;
       tmpBlocks.clear();
     }
+#endif
 
     // Check for all CSRs used in EntryBlock.
     if (CSRUsed[EntryBlock] == UsedCSRegs) {
@@ -1096,14 +1125,18 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
   }
 
 #ifndef NDEBUG
+  if (ShrinkWrapThisFunction) {
+    DOUT << "-----------------------------------------------------------\n";
+    DOUT << "ENABLED: " << Fn.getFunction()->getName() << "\n";
+  }
   DOUT << "-----------------------------------------------------------\n";
-  DOUT << ">>>>Final SAVE, RESTORE:\n";
+  DOUT << ">>>> Final SAVE, RESTORE:\n";
   DOUT << "-----------------------------------------------------------\n";
   DOUT << "iterations = " << iterations << "\n";
   DOUT << "-----------------------------------------------------------\n";
   dumpSRSets();
   DOUT << "-----------------------------------------------------------\n";
-  DOUT << "<<<<Final SAVE, RESTORE\n";
+  DOUT << "<<<< Final SAVE, RESTORE\n";
   DOUT << "-----------------------------------------------------------\n";
 #endif
 }
