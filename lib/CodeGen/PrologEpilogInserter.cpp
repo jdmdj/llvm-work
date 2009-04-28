@@ -169,6 +169,11 @@ namespace {
     // DEBUG
     std::string MFName;
 
+    // Flag indicating that the current function
+    // has at least one "short" path in the machine
+    // CFG from the entry block to an exit block.
+    bool HasFastExitPath;
+
     // Analysis info for spill/restore placement.
     // "CSR": "callee saved register".
 
@@ -251,8 +256,18 @@ namespace {
       return LP;
     }
 
+    // Propgate CSRs used in MBB to all MBBs of loop LP.
     void propagateUsesAroundLoop(MachineBasicBlock* MBB, MachineLoop* LP);
 
+    // Mark this function as having fast exit paths.
+    void findFastExitPaths();
+
+    // Convenience for recognizing return blocks.
+    bool isReturnBlock(MachineBasicBlock* MBB) {
+      return (MBB && !MBB->empty() && MBB->back().getDesc().isReturn());
+    }
+
+    // EXP -- get CSRs that are live-in at MBB.
     void getLiveInCSRegs(MachineBasicBlock* MBB, CSRegSet& LiveInCSRegs) {
       const std::vector<CalleeSavedInfo> CSI =
         MF->getFrameInfo()->getCalleeSavedInfo();
@@ -270,7 +285,6 @@ namespace {
         }
       }
     }
-
 
 #ifndef NDEBUG
     // Debugging methods.
@@ -412,6 +426,7 @@ void PEI::initShrinkWrappingInfo() {
   EntryBlock = 0;
   if (! ReturnBlocks.empty())
     ReturnBlocks.clear();
+  HasFastExitPath = false;
   UsedCSRegs.clear();
   CSRUsed.clear();
   TLLoops.clear();
@@ -489,6 +504,7 @@ bool PEI::calcAnticInOut(MachineBasicBlock* MBB) {
 
     AnticOut[MBB] = AnticIn[SUCC];
     for (++i; i != e; ++i) {
+      SUCC = successors[i];
       AnticOut[MBB] &= AnticIn[SUCC];
     }
     if (prevAnticOut != AnticOut[MBB])
@@ -522,6 +538,7 @@ bool PEI::calcAvailInOut(MachineBasicBlock* MBB) {
 
     AvailIn[MBB] = AvailOut[PRED];
     for (++i; i != e; ++i) {
+      PRED = predecessors[i];
       AvailIn[MBB] &= AvailOut[PRED];
     }
     if (prevAvailIn != AvailIn[MBB])
@@ -592,6 +609,60 @@ void PEI::propagateUsesAroundLoop(MachineBasicBlock* MBB, MachineLoop* LP) {
   }
 }
 
+void PEI::findFastExitPaths() {
+  if (! EntryBlock)
+    return;
+  // See if there is a path from EntryBlock to any return
+  // block consisting of fewer than N(=4) edges:
+  //        Entry
+  //          |     ...
+  //          v      |
+  //         B1<-----+
+  //          |
+  //          v
+  //       Return
+
+  for (MachineBasicBlock::succ_iterator SI = EntryBlock->succ_begin(),
+         SE = EntryBlock->succ_end(); SI != SE; ++SI) {
+    MachineBasicBlock* SUCC = *SI;
+    // Check the imm. successors for quick determination.
+    if (isReturnBlock(SUCC)) {
+#ifndef NDEBUG
+      DOUT << "Found fast exit path from " << getBasicBlockName(EntryBlock)
+           << " to immediate successor "   << getBasicBlockName(SUCC) << "\n";
+#endif
+      HasFastExitPath = true;
+      break;
+    }
+    // Traverse df from SUCC, accumulate path length.
+    int pathLength = 1; // already made one hop to get to SUCC.
+#ifndef NDEBUG
+    DOUT << "Path from " << getBasicBlockName(EntryBlock)
+         << " through "  << getBasicBlockName(SUCC) << ":";
+#endif
+    for (df_iterator<MachineBasicBlock*> BI = df_begin(SUCC),
+           BE = df_end(SUCC); BI != BE; ++BI) {
+      MachineBasicBlock* SBB = *BI;
+      ++pathLength;
+#ifndef NDEBUG
+      DOUT << " " << getBasicBlockName(SBB);
+#endif
+    }
+    if (pathLength < 4) {
+#ifndef NDEBUG
+      DOUT << " is a fast exit path\n";
+#endif
+      HasFastExitPath = true;
+      break;
+    }
+#ifndef NDEBUG
+    else {
+      DOUT << " is not a fast exit path\n";
+    }
+#endif
+  }
+}
+
 /// calculateSets - helper function for placeCSRSpillsAndRestores,
 /// collect the CSRs used in this function, develop the DF sets that
 /// describe the minimal regions in the Machine CFG around which spills,
@@ -622,10 +693,14 @@ bool PEI::calculateSets(MachineFunction &Fn) {
   EntryBlock = Fn.begin();
   for (MachineFunction::iterator MBB = Fn.begin(), E = Fn.end();
        MBB != E; ++MBB)
-    if (!MBB->empty() && MBB->back().getDesc().isReturn())
+    if (isReturnBlock(MBB))
       ReturnBlocks.push_back(MBB);
 
-  // Limit shrink wrapping to functions with fewer than 1K MBBs.
+  // Determine if this function has fast exit paths.
+  findFastExitPaths();
+
+  // Limit shrink wrapping via this iterative bit vector
+  // DFA implementation to functions with fewer than 1K MBBs.
   if (Fn.size() > 1000) {
 #ifndef NDEBUG
     if (ShrinkWrapThisFunction)
@@ -732,6 +807,12 @@ bool PEI::calculateSets(MachineFunction &Fn) {
     }
   }
 
+#ifndef NDEBUG
+  if (HasFastExitPath) {
+    DOUT << Fn.getFunction()->getName() << " has fast exit path\n";
+  }
+#endif
+
   if (ShrinkWrapThisFunction) {
     if (allCSRUsesInEntryBlock) {
 #ifndef NDEBUG
@@ -810,8 +891,8 @@ bool PEI::calculateSets(MachineFunction &Fn) {
     return false;
   }
 
-  // Build DF sets to determine minimal regions in the MCFG around which
-  // CSRs must be spilled and restored.
+  // Build initial DF sets to determine minimal regions in the
+  // Machine CFG around which CSRs must be spilled and restored.
   calculateAnticAvail(Fn);
 
   return true;
@@ -834,14 +915,32 @@ bool PEI::addCSRUsesForCoverBlock(MachineBasicBlock* MBB,
         break;
       }
     }
+    if (!CSRRestore[MBB].empty()) {
+      for (MachineBasicBlock::pred_iterator PI = MBB->pred_begin(),
+             PE = MBB->pred_end(); PI != PE; ++PI) {
+        MachineBasicBlock* PRED = *PI;
+        if (PRED->succ_size() > 1) {
+          processThisBlock = true;
+          break;
+        }
+      }
+    }
     if (! processThisBlock)
       return false;
   }
 
-  bool addedUses = false;
-  bool propagateSpills = (! CSRSave[MBB].empty());
-  bool propagateRestores = (! CSRRestore[MBB].empty());
+  CSRegSet prop;
+  if (!CSRSave[MBB].empty())
+    prop = CSRSave[MBB];
+  else if (!CSRRestore[MBB].empty())
+    prop = CSRRestore[MBB];
+  else
+    prop = CSRUsed[MBB];
+  if (prop.empty())
+    return false;
+
   // Add uses to all immed. successors of MBB.
+  bool addedUses = false;
   for (MachineBasicBlock::succ_iterator SI = MBB->succ_begin(),
          SE = MBB->succ_end(); SI != SE; ++SI) {
     MachineBasicBlock* SUCC = *SI;
@@ -849,23 +948,12 @@ bool PEI::addCSRUsesForCoverBlock(MachineBasicBlock* MBB,
     // Self-loop
     if (SUCC == MBB)
       continue;
-    if (propagateSpills && ! CSRUsed[SUCC].contains(CSRSave[MBB])) {
-      CSRUsed[SUCC] |= CSRSave[MBB];
+    if (! CSRUsed[SUCC].contains(prop)) {
+      CSRUsed[SUCC] |= prop;
       addedUses = true;
       blks.push_back(SUCC);
 #ifndef NDEBUG
-      DOUT << "Adding uses for " << stringifyCSRegSet(CSRSave[MBB])
-           << " from "           << getBasicBlockName(MBB)
-           << " to successor "   << getBasicBlockName(SUCC) << "\n";
-#endif
-    }
-    if (propagateRestores &&
-        ! CSRUsed[SUCC].contains(CSRRestore[MBB])) {
-      CSRUsed[SUCC] |= CSRRestore[MBB];
-      addedUses = true;
-      blks.push_back(SUCC);
-#ifndef NDEBUG
-      DOUT << "Adding uses for " << stringifyCSRegSet(CSRRestore[MBB])
+      DOUT << "Adding uses for " << stringifyCSRegSet(prop)
            << " from "           << getBasicBlockName(MBB)
            << " to successor "   << getBasicBlockName(SUCC) << "\n";
 #endif
@@ -877,23 +965,12 @@ bool PEI::addCSRUsesForCoverBlock(MachineBasicBlock* MBB,
     // Self-loop
     if (PRED == MBB)
       continue;
-    if (propagateSpills && ! CSRUsed[PRED].contains(CSRSave[MBB])) {
-      CSRUsed[PRED] |= CSRSave[MBB];
+    if (! CSRUsed[PRED].contains(prop)) {
+      CSRUsed[PRED] |= prop;
       addedUses = true;
       blks.push_back(PRED);
 #ifndef NDEBUG
-      DOUT << "Adding uses for " << stringifyCSRegSet(CSRSave[MBB])
-           << " from "           << getBasicBlockName(MBB)
-           << " to predecessor " << getBasicBlockName(PRED) << "\n";
-#endif
-    }
-    if (propagateRestores &&
-        ! CSRUsed[PRED].contains(CSRRestore[MBB])) {
-      CSRUsed[PRED] |= CSRRestore[MBB];
-      addedUses = true;
-      blks.push_back(PRED);
-#ifndef NDEBUG
-      DOUT << "Adding uses for " << stringifyCSRegSet(CSRRestore[MBB])
+      DOUT << "Adding uses for " << stringifyCSRegSet(prop)
            << " from "           << getBasicBlockName(MBB)
            << " to predecessor " << getBasicBlockName(PRED) << "\n";
 #endif
@@ -924,13 +1001,19 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
 
       // Intersect (CSRegs - AnticIn[P]) for all predecessors P of MBB
       CSRegSet anticInPreds;
-      MachineBasicBlock::pred_iterator PI = MBB->pred_begin(),
-        PE = MBB->pred_end();
-      if (PI != PE) {
+      SmallVector<MachineBasicBlock*, 4> predecessors;
+      for (MachineBasicBlock::pred_iterator PI = MBB->pred_begin(),
+             PE = MBB->pred_end(); PI != PE; ++PI) {
         MachineBasicBlock* PRED = *PI;
+        if (PRED != MBB)
+          predecessors.push_back(PRED);
+      }
+      unsigned i = 0, e = predecessors.size();
+      if (i != e) {
+        MachineBasicBlock* PRED = predecessors[i];
         anticInPreds = UsedCSRegs - AnticIn[PRED];
-        for (++PI; PI != PE; ++PI) {
-          PRED = *PI;
+        for (++i; i != e; ++i) {
+          PRED = predecessors[i];
           anticInPreds &= (UsedCSRegs - AnticIn[PRED]);
         }
       } else {
@@ -940,7 +1023,6 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
         // is not the case in the real world.
         anticInPreds = UsedCSRegs;
       }
-
       // Compute spills required at MBB:
       CSRSave[MBB] |= (AnticIn[MBB] - AvailIn[MBB]) & anticInPreds;
 
@@ -958,7 +1040,7 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
       }
       // Remember this block for adding restores to successor
       // blocks for multi-entry region.
-      if (! CSRSave[MBB].empty() && MBB->succ_size() > 1)
+      if (! CSRSave[MBB].empty())
         coverBlocks.push_back(MBB);
 
 #ifndef NDEBUG
@@ -969,14 +1051,20 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
 
       // Intersect (CSRegs - AvailOut[S]) for all successors S of MBB
       CSRegSet availOutSucc;
-      MachineBasicBlock::succ_iterator SI = MBB->succ_begin(),
-        SE = MBB->succ_end();
-      if (SI != SE) {
+      SmallVector<MachineBasicBlock*, 4> successors;
+      for (MachineBasicBlock::succ_iterator SI = MBB->succ_begin(),
+             SE = MBB->succ_end(); SI != SE; ++SI) {
         MachineBasicBlock* SUCC = *SI;
-
+        if (SUCC != MBB)
+          successors.push_back(SUCC);
+      }
+      i = 0;
+      e = successors.size();
+      if (i != e) {
+        MachineBasicBlock* SUCC = successors[i];
         availOutSucc = UsedCSRegs - AvailOut[SUCC];
-        for (++SI; SI != SE; ++SI) {
-          SUCC = *SI;
+        for (++i; i != e; ++i) {
+          SUCC = successors[i];
           availOutSucc &= (UsedCSRegs - AvailOut[SUCC]);
         }
       } else {
@@ -1035,8 +1123,9 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
       assert(exitBlocks.size() > 0 && "Loop has no top level exit blocks?");
       for (unsigned i = 0, e = exitBlocks.size(); i != e; ++i) {
         MachineBasicBlock* EXB = exitBlocks[i];
-        if (! CSRRestore[EXB].contains(loopSpills) &&
-            ! CSRUsed[EXB].contains(loopSpills)) {
+        //if (! CSRRestore[EXB].contains(loopSpills) &&
+        //    ! CSRUsed[EXB].contains(loopSpills)) {
+        if (! CSRUsed[EXB].contains(loopSpills)) {
           CSRUsed[EXB] |= loopSpills;
           changed = true;
 #ifndef NDEBUG
@@ -1061,103 +1150,20 @@ void PEI::placeSpillsAndRestores(MachineFunction &Fn) {
       tmpBlocks.clear();
     }
 
-#if 0
-    // Check for all CSRs used in EntryBlock.
-    if (CSRUsed[EntryBlock] == UsedCSRegs) {
-#ifndef NDEBUG
-      DOUT << "-----------------------------------------------------------\n";
-      DOUT << "DISABLED: " << Fn.getFunction()->getName()
-           << ": all CSRs used in EntryBlock\n";
-#endif
-      ShrinkWrapThisFunction = false;
-      break;
-    }
-
-    // Check for all CSRs restored in all exit blocks, in which
-    // case we can skip the rest of the placement phase.
-    bool allReturnsRestoreAllCSRs = true;
-    for (unsigned ri = 0, re = ReturnBlocks.size(); ri != re; ++ri) {
-      if (CSRRestore[ReturnBlocks[ri]] != UsedCSRegs) {
-        allReturnsRestoreAllCSRs = false;
-        break;
-      }
-    }
-    if (allReturnsRestoreAllCSRs) {
-#ifndef NDEBUG
-      DOUT << "-----------------------------------------------------------\n";
-      DOUT << "DISABLED: " << Fn.getFunction()->getName()
-           << ": all CSRs restored in all return blocks\n";
-#endif
-      ShrinkWrapThisFunction = false;
-      break;
-    }
-#endif
-
-    // If things changed, iterate the DFA...
+    // If CSRUsed[] changed, iterate the DFA...
     if (changed) {
       calculateAnticAvail(Fn);
     }
     ++iterations;
   }
 
-  // EXP -- post-process top level loops.
-  for (DenseMap<MachineBasicBlock*, MachineLoop*>::iterator
-         I = TLLoops.begin(), E = TLLoops.end(); I != E; ++I) {
-    MachineBasicBlock* MBB = I->first;
-    MachineLoop* LP = I->second;
-    MachineBasicBlock* HDR = LP->getHeader();
-    SmallVector<MachineBasicBlock*, 4> exitBlocks;
-    CSRegSet loopSpills;
-
-    loopSpills = CSRSave[MBB];
-    if (CSRSave[MBB].empty()) {
-      loopSpills = CSRUsed[HDR];
-      assert(!loopSpills.empty() && "No CSRs used in loop?");
-    } else if (CSRRestore[MBB].contains(CSRSave[MBB]))
-      continue;
-
-    LP->getExitBlocks(exitBlocks);
-    assert(exitBlocks.size() > 0 && "Loop has no top level exit blocks?");
-    for (unsigned i = 0, e = exitBlocks.size(); i != e; ++i) {
-      MachineBasicBlock* EXB = exitBlocks[i];
-      if (! CSRRestore[EXB].contains(loopSpills)) {
-        // Check for restores of loopSpills below EXB.
-        bool needsRestore = true;
-        for (df_iterator<MachineBasicBlock*> BI = df_begin(EXB),
-               BE = df_end(EXB); BI != BE; ++BI) {
-          MachineBasicBlock* SBB = *BI;
-          if (CSRRestore[SBB].contains(loopSpills)) {
-            needsRestore = false;
-            break;
-          }
-        }
-        if (needsRestore) {
-          CSRRestore[EXB] |= loopSpills;
 #ifndef NDEBUG
-          DOUT << "Adding restores " << stringifyCSRegSet(loopSpills)
-               << " for loop "       << getBasicBlockName(MBB)
-               << " to "             << getBasicBlockName(EXB) << "\n";
-#endif
-        }
-      }
-    }
+  DOUT << "-----------------------------------------------------------\n";
+  DOUT << "ENABLED: " << Fn.getFunction()->getName();
+  if (HasFastExitPath) {
+    DOUT << " (fast exit path)";
   }
-
-#if 0
-  if (! ShrinkWrapThisFunction) {
-    CSRSave.clear();
-    CSRRestore.clear();
-    CSRSave[EntryBlock] = UsedCSRegs;
-    for (unsigned ri = 0, re = ReturnBlocks.size(); ri != re; ++ri)
-      CSRRestore[ReturnBlocks[ri]] = UsedCSRegs;
-  }
-#endif
-
-#ifndef NDEBUG
-  if (ShrinkWrapThisFunction) {
-    DOUT << "-----------------------------------------------------------\n";
-    DOUT << "ENABLED: " << Fn.getFunction()->getName() << "\n";
-  }
+  DOUT << "\n";
   DOUT << "-----------------------------------------------------------\n";
   DOUT << ">>>> Final SAVE, RESTORE:\n";
   DOUT << "-----------------------------------------------------------\n";
